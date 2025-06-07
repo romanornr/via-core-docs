@@ -1,6 +1,97 @@
 # Via L2 Bitcoin ZK-Rollup Documentation
 
-Welcome to the comprehensive documentation for the Via L2 Bitcoin ZK-Rollup system. This documentation covers all aspects of the Via L2 platform, a Layer 2 scaling solution built on top of Bitcoin that leverages zero-knowledge proofs to enable high-throughput, low-cost transactions while inheriting the security guarantees of the Bitcoin blockchain.
+Welcome to the comprehensive documentation for Via, a Bitcoin-native Layer 2 ZK-Rollup built from the ground up specifically for Bitcoin's unique architecture. Unlike traditional Layer 2 solutions adapted from Ethereum, Via leverages a revolutionary three-layer separation of concerns: Bitcoin provides security and settlement, Celestia handles data availability, and Via executes transactions through a high-performance zkEVM environment. This innovative architecture enables Bitcoin-native scaling without compromising on security or decentralization.
+
+Via's breakthrough design centers on Bitcoin-native primitives including Taproot integration, Bitcoin inscriptions for metadata attestation, and a MuSig2 multi-signature bridge for secure withdrawals. Rather than relying on smart contracts, Via employs a distributed verifier network where independent validators attest to system state through Bitcoin inscriptions, creating a truly decentralized verification mechanism with threshold consensus. This approach maintains Bitcoin's security model while enabling high-throughput, low-cost transactions that inherit the full security guarantees of the Bitcoin blockchain.
+
+The system's separation of data availability to Celestia, combined with Bitcoin's role as the settlement layer, creates an unprecedented scaling solution that preserves Bitcoin's core principles while delivering modern Layer 2 capabilities. This documentation covers all aspects of Via's innovative architecture, from its Bitcoin-native bridge mechanisms to its distributed proof verification system.
+
+## Why Choose Via?
+
+Via represents the next evolution in Bitcoin scaling, offering unique advantages over both Ethereum-based solutions and other Bitcoin Layer 2 approaches. Here's why Via stands out as the premier choice for building on Bitcoin.
+
+### 🛡️ Advantages over Ethereum
+
+**True Bitcoin Security**
+- Inherits Bitcoin's unmatched Proof-of-Work security model with over 15+ years of battle-tested resilience
+- No reliance on Ethereum's newer Proof-of-Stake consensus mechanism
+- Benefits from Bitcoin's $1+ trillion security budget and global mining infrastructure
+
+**Superior Decentralization**
+- Built on Bitcoin's truly decentralized network with thousands of independent miners worldwide
+- Avoids Ethereum's validator concentration risks and staking centralization concerns
+- No single points of failure or validator slashing risks
+
+**Proven Censorship Resistance**
+- Leverages Bitcoin's unprecedented track record of censorship resistance since 2009
+- No exposure to potential regulatory pressures on Ethereum validators
+- Maintains Bitcoin's neutral, apolitical monetary properties
+
+**Store of Value Foundation**
+- Built on the world's premier digital store of value asset
+- No exposure to ETH price volatility for security guarantees
+- Aligns with Bitcoin's long-term value proposition and institutional adoption
+
+**No Gas Token Risk**
+- Eliminates dependency on ETH for security and operations
+- Users transact with Bitcoin, the most liquid and widely accepted cryptocurrency
+- Reduces complexity and risk associated with multi-token ecosystems
+
+### ⚡ Advantages over Other Bitcoin L2s
+
+**Cryptographic Finality**
+- ZK proofs provide instant mathematical finality vs optimistic rollups' 7-day challenge periods
+- No waiting periods for withdrawals or transaction confirmation
+- Immediate settlement certainty for users and applications
+
+**Zero Fraud Risk**
+- Mathematical proofs eliminate fraud proof assumptions and economic game theory
+- No reliance on watchtowers, challengers, or economic incentives for security
+- Cryptographic guarantees that are impossible to game or manipulate
+
+**Enhanced Security Model**
+- Distributed verifier network eliminates single operator risks common in other L2s
+- Multiple independent validators must attest to system state
+- Threshold consensus mechanism prevents single points of failure
+
+**Bitcoin-Native Integration**
+- Purpose-built for Bitcoin's UTXO model and scripting capabilities
+- Native Taproot integration and Bitcoin inscription support
+- Not an adapted solution from other blockchain architectures
+
+**Scalable Data Architecture**
+- Celestia integration provides unlimited data availability scaling
+- Efficient data compression and batching mechanisms
+- Avoids Bitcoin block space limitations while maintaining security
+
+### 🚀 Unique Value Propositions
+
+**Best of Both Worlds**
+- Combines Bitcoin's unmatched security with Ethereum's rich execution environment
+- Full EVM compatibility enables seamless migration of existing dApps
+- Access to Bitcoin's liquidity with modern smart contract capabilities
+
+**Future-Proof Architecture**
+- Modular design that evolves with Bitcoin protocol upgrades
+- Separation of concerns allows independent optimization of each layer
+- Ready for Bitcoin's future enhancements like covenants and advanced scripting
+
+**Superior Developer Experience**
+- Complete Ethereum tooling compatibility (MetaMask, Hardhat, Remix, etc.)
+- Familiar development environment with Bitcoin's security guarantees
+- Extensive documentation and developer resources
+
+**Institutional Grade**
+- Enterprise-ready infrastructure with Bitcoin's regulatory clarity
+- Proven security model trusted by institutions and governments
+- Compliance-friendly architecture built on regulated Bitcoin foundation
+
+**Unmatched Scalability**
+- Theoretical throughput of 10,000+ TPS with sub-second finality
+- Horizontal scaling through data availability layer separation
+- Cost-effective transactions while maintaining security guarantees
+
+Via doesn't just offer another Layer 2 solution. It represents a fundamental advancement in how we scale Bitcoin while preserving its core principles of security, decentralization, and censorship resistance.
 
 ## 📚 How to Use This Documentation
 
@@ -128,7 +219,7 @@ If you encounter issues or have questions while working with the Via L2 system, 
 
 1. **Check the Documentation**: First, ensure you've read the relevant documentation sections. Many common questions are answered in these documents.
 
-2. **GitHub Issues**: For bugs or feature requests, check existing GitHub issues or create a new one in the [Via L2 repository](https://github.com/via-org/via-core).
+2. **GitHub Issues**: For bugs or feature requests, check existing GitHub issues or create a new one in the [Via L2 repository](https://github.com/vianetwork/via-core).
 
 3. **Developer Community**: Join the Via L2 developer community on Discord or Telegram can be found on our site https://buildonvia.org/.
 
