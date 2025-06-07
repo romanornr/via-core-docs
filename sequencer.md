@@ -2,9 +2,9 @@
 
 ## Overview
 
-The **Sequencer** is the heart of the Via L2 Bitcoin ZK-Rollup system, responsible for orchestrating the entire transaction processing pipeline from user submission to Bitcoin inscription. It acts as the central coordinator that receives transactions, orders them, executes them in the VM, groups them into blocks and batches, and ultimately ensures their data is committed to Bitcoin for security and finality.
+The **Sequencer** is the component that processes transactions in the Via L2 Bitcoin ZK-Rollup system. It implements the L2 rollup protocol by receiving transactions from users and Bitcoin, executing them using specific ordering algorithms, and managing state transitions within the zkEVM. The sequencer coordinates with Bitcoin for data availability by grouping processed transactions into batches and submitting them as inscriptions to the Bitcoin blockchain.
 
-Think of the sequencer as a sophisticated transaction processing engine that bridges the gap between fast L2 execution and secure L1 (Bitcoin) settlement. It maintains the delicate balance between throughput, latency, and security that makes L2 rollups viable.
+The sequencer runs transaction ordering and execution algorithms that process L2 transactions for immediate finality while aggregating them into larger batches for efficient Bitcoin submission. It manages the complete transaction lifecycle from mempool ingestion through VM execution to Bitcoin inscription, implementing the core rollup protocol that enables scalable transaction processing while maintaining Bitcoin's security guarantees.
 
 ## Core Responsibilities
 
