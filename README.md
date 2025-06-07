@@ -85,10 +85,13 @@ This README serves as the main entry point to all documentation. Documents are o
 - [**Fee Mechanism**](fee_mechanism.md) 🟢 ⏱️ 15 min  
   How transaction fees are calculated and processed.
 
-- [**LoadNext Tool**](loadnext_tool.md) 🟢 ⏱️ 10 min  
+- [**LoadNext Tool**](loadnext_tool.md) 🟢 ⏱️ 10 min
   Utility for testing and benchmarking the system.
 
-- [**Workflow Analysis**](workflow_analysis.md) 🟡 ⏱️ 15 min  
+- [**Examples and Utilities**](examples_and_utilities.md) 🟢 ⏱️ 25 min
+  Comprehensive examples and utilities for ZK proof verification, fee rate fetching, MuSig2 operations, and development tools.
+
+- [**Workflow Analysis**](workflow_analysis.md) 🟡 ⏱️ 15 min
   Analysis of common workflows and operational patterns.
 
 ### 🔐 Security and Cryptography
@@ -138,6 +141,42 @@ If you encounter issues or have questions while working with the Via L2 system, 
 - Diagrams are created using Mermaid syntax for consistency and maintainability.
 - Technical terms are defined when first introduced and collected in a glossary.
 
+## 🔄 Recent Updates
+
+This documentation has been updated to reflect the latest changes in the Via L2 system, including:
+
+### Enhanced Configuration Support
+- **Wallet Address Configuration**: New wallet address fields for verifier and BTC sender components
+- **Fee Rate Limits**: Network-specific fee rate limits for Bitcoin transactions (Mainnet, Testnet, Regtest)
+- **Server Component Selection**: Selective component execution via `--components` CLI flag
+- **Enhanced Genesis Configuration**: Updated genesis values and l2_chain_id usage
+
+### Improved Fee Management
+- **External API Fallback**: Bitcoin client fallback to external APIs for fee rate estimation
+- **Mempool Integration**: Enhanced fee calculation using mempool data via `get_mempool_info()` method
+- **Network-Aware Fee Strategies**: Dynamic fee adjustment based on network conditions
+
+### Enhanced API and RPC Layer
+- **Wallet-Specific RPC URLs**: Support for Bitcoin RPC URLs with wallet-specific paths
+- **Coordinator API Validation**: Stricter cryptographic validation for partial signature submissions
+- **Database Query Improvements**: Enhanced L1 batch details queries for better data availability
+
+### Advanced Verifier Features
+- **Synchronization Improvements**: Enhanced verifier synchronization with L1 pause mechanism
+- **MuSig2 Enhancements**: New partial signature verification utilities and examples
+- **Multi-Client Support**: Multiple Bitcoin client instances for different operational roles
+
+### Bridge Enhancements
+- **Enhanced Deposit Validation**: Stricter L2 receiver address validation and minimum deposit requirements
+- **Simplified Transaction Creation**: Standardized empty calldata for deposit transactions
+- **Testnet Bootstrap Support**: Comprehensive testnet configuration and bootstrap transaction IDs
+
+### New Examples and Utilities
+- **ZK Proof Verification**: Complete examples for verifying ZK proofs from Data Availability
+- **Fee Rate Management**: Advanced fee estimation examples with multiple strategies
+- **MuSig2 Operations**: Partial signature verification and session management examples
+- **Development Tools**: Testnet bootstrapping utilities and selective component execution
+
 ---
 
-*This documentation is maintained by the Via L2 team and community contributors. Last updated: April 2025.*
+*This documentation is maintained by the Via L2 team and community contributors. Last updated: June 2025.*

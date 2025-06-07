@@ -10,6 +10,9 @@ This document provides an overview of the key configuration files, environment v
 4. [Environment Variables](#environment-variables)
 5. [Docker Deployment Configuration](#docker-deployment-configuration)
 6. [Network Configuration](#network-configuration)
+7. [Wallet Configuration](#wallet-configuration)
+8. [Fee Management Configuration](#fee-management-configuration)
+9. [Server Component Selection](#server-component-selection)
 
 ## Configuration Architecture
 
@@ -74,6 +77,7 @@ l1_batch_commit_data_generator_mode: Rollup
 
 Key parameters:
 - `genesis_root`: The root hash of the initial state
+- `genesis_batch_commitment`: The batch commitment hash for genesis
 - `genesis_protocol_semantic_version`: The semantic version of the protocol (e.g., '0.26.0')
 - `bootloader_hash`: Hash of the bootloader contract
 - `default_aa_hash`: Hash of the default account abstraction contract
@@ -108,6 +112,7 @@ Key parameters:
 - `id`: Unique identifier for the chain
 - `name`: Name of the chain
 - `chain_id`: The chain ID for this chain
+- `zksync_network_id`: The ZkSync network identifier
 - `prover_version`: The version of the prover to use
 - `configs`: Directory containing chain-specific component configurations
 - `rocks_db_path`: Path to the RocksDB database for this chain
@@ -122,6 +127,25 @@ Key parameters:
 - `batch_executor_config`: Configuration for the Batch Executor
 - `seal_criteria_config`: Configuration for when to seal blocks and batches
 - `btc_sender_config`: Configuration for sending data to Bitcoin
+
+### BTC Sender Configuration
+
+The BTC Sender component handles Bitcoin transaction broadcasting and is configured through files and environment variables:
+
+Key parameters:
+- `wallet_address`: Bitcoin wallet address for the BTC sender component
+- `btc_rpc_url`: Bitcoin RPC URL, supports wallet-specific paths
+- `fee_strategy`: Fee rate management configuration
+
+Example configuration in `etc/env/base/via_private.toml`:
+```toml
+wallet_address = "bc1qsenderaddress..."
+```
+
+The BTC RPC URL can include wallet-specific paths for enhanced wallet management:
+```toml
+btc_rpc_url = "http://localhost:8332/wallet/mywallet"
+```
 
 ### Prover Configuration
 
@@ -139,9 +163,17 @@ The Verifier is configured through files in `configs/` and environment variables
 
 Key parameters:
 - `verifier_mode`: The mode of the Verifier (COORDINATOR or VERIFIER)
+- `wallet_address`: Bitcoin wallet address for the verifier component
 - `required_signers`: Number of signers required for MuSig2 signatures
 - `verifiers_pub_keys`: Public keys of all Verifiers
 - `verifier_request_timeout`: Timeout for Verifier requests
+
+Example configuration in `etc/env/configs/via_verifier.toml`:
+```toml
+wallet_address = "bc1qverifieraddress..."
+verifier_mode = "VERIFIER"
+required_signers = 3
+```
 
 ### Celestia Integration Configuration
 
@@ -177,6 +209,7 @@ The Via L2 system uses environment variables for runtime configuration. Here are
 - `VIA_BTC_CLIENT_PASSWORD`: Password for Bitcoin node authentication
 - `VIA_BTC_NETWORK`: Bitcoin network to use (mainnet, testnet, regtest)
 - `VIA_BTC_BRIDGE_ADDRESS`: Bitcoin address for the bridge (MuSig2 multisig address)
+- `VIA_BTC_SENDER_WALLET_ADDRESS`: Wallet address for the BTC sender component
 
 ### Celestia Configuration
 
@@ -192,6 +225,7 @@ The Via L2 system uses environment variables for runtime configuration. Here are
 - `VIA_VERIFIER_REQUIRED_SIGNERS`: Number of signers required for MuSig2 signatures
 - `VIA_VERIFIER_PUBLIC_KEYS`: Comma-separated list of Verifier public keys
 - `VIA_VERIFIER_PROTOCOL_VERSION`: Current protocol version for the verifier
+- `VIA_VERIFIER_WALLET_ADDRESS`: Wallet address for the verifier component
 
 ### Prover Configuration
 
@@ -298,6 +332,115 @@ Protocol versions are stored in the database:
 - `VIA_VERIFIER_PROTOCOL_VERSION`: Current protocol version for the verifier
 - `VIA_SEQUENCER_PROTOCOL_VERSION`: Current protocol version for the sequencer
 
+## Wallet Configuration
+
+The Via L2 system supports wallet-specific configuration for Bitcoin operations across different components.
+
+### Wallet Address Configuration
+
+Both BTC sender and verifier components require wallet address configuration:
+
+```toml
+# etc/env/base/via_private.toml
+wallet_address = "bc1qexampleaddress..."
+
+# etc/env/configs/via_coordinator.toml
+wallet_address = "bc1qcoordinatoraddress..."
+
+# etc/env/configs/via_verifier.toml
+wallet_address = "bc1qverifieraddress..."
+```
+
+### Environment Variables
+
+Wallet addresses can be configured via environment variables:
+- `VIA_BTC_SENDER_WALLET_ADDRESS`: Wallet address for BTC sender operations
+- `VIA_VERIFIER_WALLET_ADDRESS`: Wallet address for verifier operations
+
+### Wallet-Specific RPC URLs
+
+Bitcoin RPC URLs support wallet-specific paths for enhanced UTXO management:
+
+```toml
+# Standard RPC configuration
+btc_rpc_url = "http://localhost:8332"
+
+# Wallet-specific RPC configuration
+btc_rpc_url = "http://localhost:8332/wallet/mywallet"
+```
+
+This enables:
+- Wallet-specific UTXO fetching
+- Enhanced wallet management capabilities
+- Multi-wallet Bitcoin node setups
+
+## Fee Management Configuration
+
+The system provides comprehensive fee rate management for Bitcoin transactions across different networks.
+
+### Fee Rate Limits
+
+Configure network-specific Bitcoin transaction fee rate caps in `etc/env/base/via_btc_client.toml`:
+
+```toml
+[fee_strategy]
+mainnet_max_fee_rate = 100  # satoshis per vbyte
+testnet_max_fee_rate = 50   # satoshis per vbyte
+regtest_max_fee_rate = 10   # satoshis per vbyte
+```
+
+### Network-Specific Configuration
+
+- **Mainnet**: Higher fee rate limits for production use (typically 100+ sat/vbyte)
+- **Testnet**: Moderate fee rate limits for testing (typically 50 sat/vbyte)
+- **Regtest**: Lower fee rate limits for local development (typically 10 sat/vbyte)
+
+### Environment Variables
+
+Fee rate limits can be overridden via environment variables:
+```bash
+export VIA_BTC_MAINNET_MAX_FEE_RATE=100
+export VIA_BTC_TESTNET_MAX_FEE_RATE=50
+export VIA_BTC_REGTEST_MAX_FEE_RATE=10
+```
+
+## Server Component Selection
+
+The via_server supports selective component execution for optimized deployments.
+
+### Component Selection
+
+Use the `--components` CLI flag to run specific components:
+
+```bash
+# Run specific components only
+via_server --components sequencer,verifier
+via_server --components btc_sender
+via_server --components all  # Run all components (default)
+```
+
+### Available Components
+
+- `sequencer`: Transaction sequencing and batch creation
+- `verifier`: Proof verification and validation
+- `btc_sender`: Bitcoin transaction broadcasting
+- `prover`: Proof generation (if applicable)
+- `all`: All available components
+
+### Environment Variable
+
+Component selection can be configured via environment variable:
+```bash
+export VIA_SERVER_COMPONENTS="sequencer,verifier"
+```
+
+### Use Cases
+
+- **Resource optimization**: Run only required components for specific deployment scenarios
+- **Debugging**: Isolate and test individual components
+- **Distributed deployment**: Deploy components across multiple servers
+- **Development**: Focus on specific functionality during development
+
 ## Conclusion
 
-The Via L2 Bitcoin ZK-Rollup system uses a comprehensive configuration system that allows for flexible deployment and operation. By understanding the key configuration files, environment variables, and parameters, operators can effectively deploy and manage the system in various environments. The protocol version management system ensures smooth upgrades and backward compatibility.
+The Via L2 Bitcoin ZK-Rollup system uses a comprehensive configuration system that allows for flexible deployment and operation. The wallet configuration system enables component-specific Bitcoin operations, while fee management ensures cost-effective transaction processing across different networks. Server component selection provides deployment flexibility for various operational requirements. By understanding the key configuration files, environment variables, and parameters, operators can effectively deploy and manage the system in various environments. The protocol version management system ensures smooth upgrades and backward compatibility.

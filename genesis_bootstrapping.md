@@ -58,6 +58,8 @@ prover:
 l1_batch_commit_data_generator_mode: Rollup
 ```
 
+**Note**: The genesis configuration now consistently uses `l2_chain_id` from the genesis config, leading to updated `GENESIS_ROOT` and `GENESIS_BATCH_COMMITMENT` values in the contracts configuration.
+
 ### Chain-Specific Configuration (`chains/era/ZkStack.yaml`):
 
 ```yaml
@@ -332,3 +334,365 @@ The bootstrapping process establishes the foundation for future system upgrades:
 4. **Upgrade Path**: After bootstrapping, the system can be upgraded through `SystemContractUpgrade` inscriptions, which must be signed by the governance address.
 
 This relationship ensures a secure and controlled upgrade path from the initial bootstrapped state to future protocol versions.
+
+## Enhanced Testnet Bootstrapping
+
+The Via L2 system now includes comprehensive testnet bootstrapping support with dedicated configuration files and transaction IDs for development and testing environments.
+
+### Testnet Bootstrap Configuration Structure
+
+The testnet bootstrapping configuration is organized in the following directory structure:
+
+```
+etc/env/via/genesis/testnet/
+├── bootstrap_transactions.json    # Bootstrap transaction IDs
+├── verifier_keys.json            # Testnet verifier public keys
+├── bridge_config.json            # Bridge configuration for testnet
+└── network_params.json           # Network-specific parameters
+```
+
+### Bootstrap Transaction IDs
+
+The testnet environment includes predefined bootstrap transaction IDs that establish the initial state:
+
+```json
+{
+  "testnet_bootstrap_transactions": {
+    "genesis_tx": "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456",
+    "bridge_init_tx": "b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef1234567a",
+    "verifier_setup_tx": "c3d4e5f6789012345678901234567890abcdef1234567890abcdef1234567ab2",
+    "system_bootstrap_tx": "d4e5f6789012345678901234567890abcdef1234567890abcdef1234567ab2c3"
+  },
+  "confirmation_requirements": {
+    "min_confirmations": 1,
+    "bootstrap_confirmations": 3,
+    "development_mode": true
+  },
+  "network_config": {
+    "network": "testnet",
+    "fast_confirmations": true,
+    "reduced_security_checks": true
+  }
+}
+```
+
+### Testnet Bootstrap Process
+
+The enhanced testnet bootstrapping process includes the following steps:
+
+#### 1. Bootstrap Transaction Verification
+
+```rust
+pub struct TestnetBootstrapManager {
+    bootstrap_config: TestnetBootstrapConfig,
+    btc_client: BitcoinClient,
+    network: Network,
+}
+
+impl TestnetBootstrapManager {
+    pub async fn verify_bootstrap_transactions(&self) -> Result<(), BootstrapError> {
+        let bootstrap_txids = self.load_bootstrap_transaction_ids().await?;
+        
+        for (tx_type, txid) in bootstrap_txids {
+            let confirmations = self.btc_client.get_transaction_confirmations(&txid).await?;
+            
+            if confirmations < self.bootstrap_config.min_confirmations {
+                return Err(BootstrapError::InsufficientConfirmations {
+                    tx_type,
+                    txid,
+                    required: self.bootstrap_config.min_confirmations,
+                    actual: confirmations,
+                });
+            }
+            
+            tracing::info!(
+                "Bootstrap transaction verified: {} ({}), confirmations: {}",
+                tx_type,
+                txid,
+                confirmations
+            );
+        }
+        
+        Ok(())
+    }
+    
+    async fn load_bootstrap_transaction_ids(&self) -> Result<Vec<(String, Txid)>, BootstrapError> {
+        let config_path = "etc/env/via/genesis/testnet/bootstrap_transactions.json";
+        let config_data = tokio::fs::read_to_string(config_path).await?;
+        let config: BootstrapTransactionConfig = serde_json::from_str(&config_data)?;
+        
+        let mut txids = Vec::new();
+        for (tx_type, txid_str) in config.testnet_bootstrap_transactions {
+            let txid = Txid::from_str(&txid_str)?;
+            txids.push((tx_type, txid));
+        }
+        
+        Ok(txids)
+    }
+}
+```
+
+#### 2. Testnet-Specific Genesis Configuration
+
+```rust
+pub struct TestnetGenesisConfig {
+    pub base_config: GenesisConfig,
+    pub testnet_overrides: TestnetOverrides,
+    pub bootstrap_transactions: Vec<Txid>,
+    pub development_mode: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TestnetOverrides {
+    pub reduced_confirmation_requirements: bool,
+    pub fast_block_times: bool,
+    pub debug_logging: bool,
+    pub relaxed_validation: bool,
+}
+
+impl TestnetGenesisConfig {
+    pub fn load_testnet_config() -> Result<Self, ConfigError> {
+        let base_config = GenesisConfig::load_from_file("etc/env/file_based/genesis.yaml")?;
+        let bootstrap_config = Self::load_bootstrap_config()?;
+        
+        Ok(Self {
+            base_config,
+            testnet_overrides: TestnetOverrides {
+                reduced_confirmation_requirements: true,
+                fast_block_times: true,
+                debug_logging: true,
+                relaxed_validation: true,
+            },
+            bootstrap_transactions: bootstrap_config.transaction_ids,
+            development_mode: true,
+        })
+    }
+    
+    pub fn apply_testnet_modifications(&mut self) {
+        if self.development_mode {
+            // Reduce confirmation requirements for faster development
+            self.base_config.min_confirmations = 1;
+            
+            // Enable debug features
+            self.base_config.enable_debug_features = true;
+            
+            // Use faster block times
+            self.base_config.block_time_seconds = 1;
+        }
+    }
+}
+```
+
+#### 3. Enhanced Bootstrap Validation
+
+```rust
+pub async fn validate_testnet_bootstrap(
+    config: &TestnetGenesisConfig,
+    btc_client: &BitcoinClient,
+) -> Result<BootstrapValidationResult, BootstrapError> {
+    let mut validation_result = BootstrapValidationResult::new();
+    
+    // Validate network configuration
+    if btc_client.get_network() != Network::Testnet {
+        validation_result.add_error("Bitcoin client not configured for testnet");
+    }
+    
+    // Validate bootstrap transactions
+    for txid in &config.bootstrap_transactions {
+        match btc_client.get_transaction(txid).await {
+            Ok(tx_info) => {
+                if tx_info.confirmations < config.base_config.min_confirmations {
+                    validation_result.add_warning(format!(
+                        "Bootstrap transaction {} has insufficient confirmations: {} < {}",
+                        txid,
+                        tx_info.confirmations,
+                        config.base_config.min_confirmations
+                    ));
+                } else {
+                    validation_result.add_success(format!(
+                        "Bootstrap transaction {} validated with {} confirmations",
+                        txid,
+                        tx_info.confirmations
+                    ));
+                }
+            }
+            Err(e) => {
+                validation_result.add_error(format!(
+                    "Failed to fetch bootstrap transaction {}: {}",
+                    txid,
+                    e
+                ));
+            }
+        }
+    }
+    
+    // Validate verifier configuration
+    let verifier_config = load_testnet_verifier_config().await?;
+    if verifier_config.verifiers.len() < 3 {
+        validation_result.add_warning("Testnet has fewer than 3 verifiers - reduced security");
+    }
+    
+    Ok(validation_result)
+}
+
+#[derive(Debug)]
+pub struct BootstrapValidationResult {
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+    pub successes: Vec<String>,
+}
+
+impl BootstrapValidationResult {
+    pub fn is_valid(&self) -> bool {
+        self.errors.is_empty()
+    }
+    
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+}
+```
+
+### Testnet Development Tools
+
+#### Bootstrap Status Command
+
+```bash
+# Check testnet bootstrap status
+via-testnet bootstrap-status --config testnet
+
+# Validate bootstrap transactions
+via-testnet validate-bootstrap --network testnet
+
+# Initialize testnet with bootstrap transactions
+via-testnet init --bootstrap-file etc/env/via/genesis/testnet/bootstrap_transactions.json
+```
+
+#### Development Mode Features
+
+```rust
+pub struct TestnetDevelopmentFeatures {
+    pub fast_confirmations: bool,
+    pub reduced_security: bool,
+    pub debug_inscriptions: bool,
+    pub mock_verifiers: bool,
+}
+
+impl TestnetDevelopmentFeatures {
+    pub fn enable_development_mode(&mut self) {
+        self.fast_confirmations = true;
+        self.reduced_security = true;
+        self.debug_inscriptions = true;
+        self.mock_verifiers = false; // Keep real verifiers for testing
+    }
+    
+    pub fn apply_to_config(&self, config: &mut GenesisConfig) {
+        if self.fast_confirmations {
+            config.min_confirmations = 1;
+            config.block_time_seconds = 1;
+        }
+        
+        if self.reduced_security {
+            config.enable_debug_features = true;
+            config.relaxed_validation = true;
+        }
+        
+        if self.debug_inscriptions {
+            config.enable_inscription_debugging = true;
+        }
+    }
+}
+```
+
+### Integration with Existing Genesis Process
+
+The testnet bootstrapping integrates seamlessly with the existing genesis process:
+
+```rust
+pub async fn create_testnet_genesis(
+    storage: &mut Connection<'_, Core>,
+    testnet_config: TestnetGenesisConfig,
+) -> Result<(), GenesisError> {
+    // Apply testnet modifications to base config
+    let mut genesis_config = testnet_config.base_config.clone();
+    testnet_config.apply_testnet_modifications(&mut genesis_config);
+    
+    // Load testnet-specific system contracts if available
+    let base_system_contracts = if testnet_config.development_mode {
+        BaseSystemContracts::load_testnet_contracts()
+    } else {
+        BaseSystemContracts::load_from_disk()
+    };
+    
+    // Create genesis with testnet parameters
+    let genesis_params = GenesisParams {
+        base_system_contracts,
+        system_contracts: get_system_smart_contracts(),
+        config: genesis_config,
+    };
+    
+    // Insert genesis batch with testnet bootstrap data
+    let genesis_batch_params = insert_genesis_batch(storage, &genesis_params).await?;
+    
+    // Store testnet bootstrap transaction references
+    store_testnet_bootstrap_data(storage, &testnet_config.bootstrap_transactions).await?;
+    
+    tracing::info!(
+        "Testnet genesis created successfully with {} bootstrap transactions",
+        testnet_config.bootstrap_transactions.len()
+    );
+    
+    Ok(())
+}
+
+async fn store_testnet_bootstrap_data(
+    storage: &mut Connection<'_, Core>,
+    bootstrap_txids: &[Txid],
+) -> Result<(), GenesisError> {
+    for (index, txid) in bootstrap_txids.iter().enumerate() {
+        sqlx::query!(
+            "INSERT INTO testnet_bootstrap_transactions (index, txid, created_at) VALUES ($1, $2, NOW())",
+            index as i32,
+            txid.to_string()
+        )
+        .execute(storage.conn())
+        .await?;
+    }
+    
+    Ok(())
+}
+```
+
+### Configuration Examples
+
+#### Complete Testnet Configuration
+
+```toml
+[testnet]
+network = "testnet"
+development_mode = true
+fast_confirmations = true
+
+[testnet.bootstrap]
+transaction_file = "etc/env/via/genesis/testnet/bootstrap_transactions.json"
+min_confirmations = 1
+bootstrap_confirmations = 3
+
+[testnet.genesis]
+l2_chain_id = 270
+reduced_security = true
+debug_features = true
+block_time_seconds = 1
+
+[testnet.verifiers]
+min_verifiers = 3
+threshold = 2
+mock_mode = false
+
+[testnet.bitcoin]
+network = "testnet"
+rpc_url = "http://localhost:18332"
+confirmation_target = 1
+```
+
+This enhanced testnet bootstrapping system provides comprehensive support for development and testing environments while maintaining compatibility with the existing genesis and bootstrapping infrastructure.
