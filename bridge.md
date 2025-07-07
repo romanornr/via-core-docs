@@ -384,6 +384,256 @@ async fn build_and_broadcast_final_transaction(
 }
 ```
 
+
+### Enhanced Withdrawal Inscription Processing
+
+The bridge now supports advanced withdrawal inscription processing with multi-input transaction capabilities for improved efficiency and UTXO management.
+
+#### Inscription-Based Withdrawal Detection
+
+The system can now process withdrawal inscriptions embedded in Bitcoin transactions, providing enhanced metadata and processing capabilities:
+
+```rust
+pub struct WithdrawalInscriptionProcessor {
+    inscription_parser: InscriptionParser,
+    withdrawal_validator: WithdrawalValidator,
+    multi_input_handler: MultiInputTransactionHandler,
+}
+
+impl WithdrawalInscriptionProcessor {
+    pub async fn process_withdrawal_inscriptions(
+        &self,
+        block_transactions: &[BitcoinTransaction],
+    ) -> Result<Vec<WithdrawalInscription>, ProcessingError> {
+        let mut withdrawal_inscriptions = Vec::new();
+        
+        for tx in block_transactions {
+            // Check for withdrawal inscriptions in transaction inputs
+            for (input_index, input) in tx.input.iter().enumerate() {
+                if let Some(inscription_data) = self.extract_inscription_from_input(input).await? {
+                    if let Some(withdrawal) = self.parse_withdrawal_inscription(&inscription_data)? {
+                        withdrawal_inscriptions.push(WithdrawalInscription {
+                            txid: tx.txid(),
+                            input_index,
+                            withdrawal_data: withdrawal,
+                            block_height: self.current_block_height,
+                            processed: false,
+                        });
+                    }
+                }
+            }
+        }
+        
+        Ok(withdrawal_inscriptions)
+    }
+    
+    async fn extract_inscription_from_input(
+        &self,
+        input: &TxIn,
+    ) -> Result<Option<InscriptionData>, ProcessingError> {
+        // Extract inscription data from transaction input witness
+        if let Some(witness) = &input.witness {
+            for witness_item in witness.iter() {
+                if let Ok(inscription) = self.inscription_parser.parse_witness_data(witness_item) {
+                    if inscription.content_type == "application/json" {
+                        return Ok(Some(inscription));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+```
+
+#### Multi-Input Transaction Support
+
+The bridge now supports processing transactions with multiple inputs, enabling more efficient UTXO consolidation and batch withdrawal processing:
+
+```rust
+pub struct MultiInputTransactionHandler {
+    utxo_selector: UtxoSelector,
+    fee_estimator: FeeEstimator,
+    transaction_builder: TransactionBuilder,
+}
+
+impl MultiInputTransactionHandler {
+    pub async fn build_multi_input_withdrawal_tx(
+        &self,
+        withdrawals: Vec<WithdrawalRequest>,
+        available_utxos: Vec<Utxo>,
+    ) -> Result<UnsignedBridgeTx, TransactionBuildError> {
+        // Select optimal UTXOs for the transaction
+        let selected_utxos = self.utxo_selector
+            .select_utxos_for_withdrawals(&withdrawals, &available_utxos)
+            .await?;
+        
+        // Build transaction with multiple inputs
+        let mut tx_builder = self.transaction_builder.new_transaction();
+        
+        // Add inputs from selected UTXOs
+        for utxo in &selected_utxos {
+            tx_builder.add_input(TxIn {
+                previous_output: OutPoint {
+                    txid: utxo.txid,
+                    vout: utxo.vout,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            });
+        }
+        
+        // Add outputs for each withdrawal
+        for withdrawal in &withdrawals {
+            tx_builder.add_output(TxOut {
+                value: Amount::from_sat(withdrawal.amount),
+                script_pubkey: withdrawal.recipient_address.script_pubkey(),
+            });
+        }
+        
+        // Add change output if necessary
+        let total_input = selected_utxos.iter().map(|u| u.value).sum::<u64>();
+        let total_output = withdrawals.iter().map(|w| w.amount).sum::<u64>();
+        let estimated_fee = self.fee_estimator.estimate_fee(&tx_builder).await?;
+        
+        if total_input > total_output + estimated_fee {
+            let change_amount = total_input - total_output - estimated_fee;
+            tx_builder.add_output(TxOut {
+                value: Amount::from_sat(change_amount),
+                script_pubkey: self.get_change_address().script_pubkey(),
+            });
+        }
+        
+        // Add OP_RETURN output with withdrawal metadata
+        let withdrawal_metadata = self.create_withdrawal_metadata(&withdrawals)?;
+        tx_builder.add_output(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: self.create_op_return_script(&withdrawal_metadata)?,
+        });
+        
+        Ok(tx_builder.build_unsigned())
+    }
+}
+```
+
+#### Enhanced UTXO Selection Algorithm
+
+The bridge implements an improved UTXO selection algorithm that prioritizes larger UTXOs for efficient transaction building:
+
+```rust
+pub struct UtxoSelector {
+    selection_strategy: UtxoSelectionStrategy,
+    dust_threshold: Amount,
+}
+
+impl UtxoSelector {
+    pub async fn select_utxos_for_withdrawals(
+        &self,
+        withdrawals: &[WithdrawalRequest],
+        available_utxos: &[Utxo],
+    ) -> Result<Vec<Utxo>, UtxoSelectionError> {
+        let total_required = withdrawals.iter().map(|w| w.amount).sum::<u64>();
+        let estimated_fee = self.estimate_transaction_fee(withdrawals.len(), available_utxos.len()).await?;
+        let target_amount = total_required + estimated_fee;
+        
+        // Sort UTXOs by value in descending order for efficient selection
+        let mut sorted_utxos = available_utxos.to_vec();
+        sorted_utxos.sort_by(|a, b| b.value.cmp(&a.value));
+        
+        let mut selected_utxos = Vec::new();
+        let mut selected_value = 0u64;
+        
+        // Select UTXOs using largest-first strategy
+        for utxo in sorted_utxos {
+            if utxo.value < self.dust_threshold.to_sat() {
+                continue; // Skip dust UTXOs
+            }
+            
+            selected_utxos.push(utxo);
+            selected_value += utxo.value;
+            
+            if selected_value >= target_amount {
+                break;
+            }
+        }
+        
+        if selected_value < target_amount {
+            return Err(UtxoSelectionError::InsufficientFunds {
+                required: target_amount,
+                available: selected_value,
+            });
+        }
+        
+        Ok(selected_utxos)
+    }
+    
+    async fn estimate_transaction_fee(
+        &self,
+        num_outputs: usize,
+        num_inputs: usize,
+    ) -> Result<u64, FeeEstimationError> {
+        // Estimate transaction size: inputs (148 bytes each) + outputs (34 bytes each) + overhead (10 bytes)
+        let estimated_size = (num_inputs * 148) + (num_outputs * 34) + 10;
+        let fee_rate = self.get_current_fee_rate().await?;
+        Ok((estimated_size as u64) * fee_rate)
+    }
+}
+```
+
+#### Withdrawal Inscription Format
+
+Withdrawal inscriptions follow a standardized JSON format for consistency and parsing efficiency:
+
+```json
+{
+  "protocol": "via",
+  "operation": "withdrawal",
+  "version": "1.0",
+  "data": {
+    "recipient": "bc1qrecipientaddress...",
+    "amount": 1000000,
+    "l2_batch_number": 12345,
+    "withdrawal_index": 0,
+    "proof_hash": "0x1234567890abcdef...",
+    "timestamp": 1640995200
+  },
+  "signature": "0xsignature..."
+}
+```
+
+#### Processing Workflow
+
+The enhanced withdrawal processing follows this workflow:
+
+1. **Inscription Detection**: Monitor Bitcoin transactions for withdrawal inscriptions
+2. **Multi-Input Analysis**: Analyze transactions with multiple inputs for batch processing
+3. **UTXO Selection**: Select optimal UTXOs using the enhanced selection algorithm
+4. **Transaction Building**: Build multi-input transactions with proper fee estimation
+5. **Signature Coordination**: Coordinate MuSig2 signatures among verifiers
+6. **Broadcasting**: Broadcast the signed transaction to the Bitcoin network
+7. **Confirmation Tracking**: Track transaction confirmations and update withdrawal status
+
+#### Configuration Parameters
+
+The enhanced withdrawal processing can be configured through environment variables:
+
+```bash
+# Multi-input transaction settings
+export VIA_BRIDGE_MAX_INPUTS_PER_TX=10
+export VIA_BRIDGE_DUST_THRESHOLD=546
+export VIA_BRIDGE_UTXO_SELECTION_STRATEGY="largest_first"
+
+# Inscription processing settings
+export VIA_BRIDGE_INSCRIPTION_CONTENT_TYPE="application/json"
+export VIA_BRIDGE_INSCRIPTION_MAX_SIZE=1024
+
+# Fee estimation settings
+export VIA_BRIDGE_FEE_RATE_MULTIPLIER=1.1
+export VIA_BRIDGE_MIN_FEE_RATE=1
+export VIA_BRIDGE_MAX_FEE_RATE=100
+```
+
 5. **Transaction Broadcasting**: Once enough verifiers have signed, the coordinator broadcasts the transaction to the Bitcoin network.
 
 ### Withdrawal Security

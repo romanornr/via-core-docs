@@ -76,6 +76,26 @@ Via represents the next evolution in Bitcoin scaling, offering unique advantages
 - Separation of concerns allows independent optimization of each layer
 - Ready for Bitcoin's future enhancements like covenants and advanced scripting
 
+**Layered by Design**
+- Settlement (Bitcoin), execution (Via zkEVM), and data availability (Celestia) are cleanly separated
+- Each layer can evolve independently without forcing hard-forks
+- Optimal specialization: each component does what it does best
+
+**BitVM-Ready Framework**
+- Architecture designed to incorporate emerging Bitcoin primitives like BitVM when mature
+- Framework can integrate future covenant proposals and trust-minimized bridge solutions
+- Positioned for richer off-chain computation that can roll back to Bitcoin trust-minimized
+
+**Upgrade-Friendly Integration**
+- Taproot, Schnorr, MuSig2, and forthcoming soft-forks (e.g., APO/Covenants) integrate at execution layer
+- No end-user friction during Bitcoin protocol upgrades
+- Automatic compatibility with Bitcoin's evolving feature set
+
+**No Trade-offs on Decentralization**
+- Every module operates under the same cryptographic finality anchored to Bitcoin
+- Improvements never introduce new trust assumptions
+- Maintains Bitcoin's decentralization guarantees across all system components
+
 **Superior Developer Experience**
 - Complete Ethereum tooling compatibility (MetaMask, Hardhat, Remix, etc.)
 - Familiar development environment with Bitcoin's security guarantees

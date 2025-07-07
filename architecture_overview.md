@@ -4,6 +4,12 @@
 
 The Via L2 Bitcoin ZK-Rollup is a Layer 2 scaling solution built on top of Bitcoin that leverages zero-knowledge proofs to enable high-throughput, low-cost transactions while inheriting the security guarantees of the Bitcoin blockchain. This document provides a comprehensive overview of the system architecture, detailing how the various components interact to create a secure, scalable, and efficient Layer 2 solution.
 
+**Recent Major Updates:**
+- **L1 Indexer System**: New dedicated Bitcoin indexing service for enhanced deposit and withdrawal processing
+- **Bridge Withdrawal Processing**: Support for bridge withdrawal inscriptions and multi-input transactions
+- **UTXO Management**: Advanced UTXO sorting and selection algorithms
+- **Configuration Management**: Environment variable-based configuration system
+
 ## 2. System Architecture
 
 The Via L2 system employs a multi-layered architecture that spans across three distinct layers:
@@ -16,13 +22,22 @@ The Via L2 system employs a multi-layered architecture that spans across three d
 graph TB
     subgraph "Layer 1 (Bitcoin)"
         BTC[Bitcoin Blockchain]
-        Inscriptions[Inscriptions]
+        Inscriptions[Bitcoin Inscriptions]
         BTCBridge[Bridge Address]
+        BridgeWithdrawals[Bridge Withdrawals]
     end
     
     subgraph "Data Availability Layer"
         Celestia[Celestia Network]
         DAClient[DA Client]
+    end
+    
+    subgraph "Bitcoin Indexing Layer"
+        L1Watcher[L1 Watcher]
+        L1Indexer[L1 Indexer]
+        IndexerDB[(Indexer Database)]
+        DepositProcessor[Deposit Processor]
+        WithdrawalProcessor[Withdrawal Processor]
     end
     
     subgraph "Layer 2 (Via)"
@@ -32,9 +47,22 @@ graph TB
         StateKeeper[State Keeper]
         VM[Execution Environment]
         Mempool[Mempool]
+        Bridge[Bridge System]
+        UTXOManager[UTXO Manager]
     end
     
     Users[Users/Applications] --> Mempool
+    BTC --> L1Watcher
+    BTC --> L1Indexer
+    Inscriptions --> L1Indexer
+    BridgeWithdrawals --> L1Indexer
+    L1Indexer --> IndexerDB
+    L1Indexer --> DepositProcessor
+    L1Indexer --> WithdrawalProcessor
+    DepositProcessor --> Bridge
+    WithdrawalProcessor --> Bridge
+    L1Watcher --> Bridge
+    Bridge --> UTXOManager
     Mempool --> Sequencer
     Sequencer --> StateKeeper
     StateKeeper --> VM
@@ -45,14 +73,41 @@ graph TB
     DAClient --> Celestia
     VerifierNetwork --> Inscriptions
     VerifierNetwork --> Celestia
-    VerifierNetwork --> BTCBridge
+    VerifierNetwork --> UTXOManager
+    UTXOManager --> BTCBridge
     BTCBridge --> BTC
     Inscriptions --> BTC
 ```
 
 ## 3. Core Components
 
-### 3.1 Sequencer
+### 3.1 Bitcoin Indexing Layer
+
+#### L1 Indexer System
+
+The L1 Indexer is a dedicated Bitcoin blockchain indexing service that provides specialized processing for deposits and withdrawals:
+
+**Key Features:**
+- **Dedicated Database Schema**: Optimized tables for deposits, withdrawals, and metadata tracking
+- **Message Processing Pipeline**: Structured processing of Bitcoin inscription messages
+- **Scalable Architecture**: High-throughput Bitcoin transaction processing capabilities
+- **Independent Operation**: Complements L1 Watcher without operational interference
+
+**Components:**
+- **Indexer Service**: Main service for Bitcoin blockchain monitoring and transaction parsing
+- **Data Access Layer**: Database abstraction layer with connection pooling and transaction management
+- **Message Processors**: Specialized processors for deposit and withdrawal transaction types
+- **CLI Tools**: [`via-indexer`](cli_reference.md#via-indexer) and [`via-restart-indexer`](cli_reference.md#via-restart-indexer) commands
+
+#### L1 Watcher
+
+The L1 Watcher continues to monitor Bitcoin blockchain for system-critical events:
+- System messages and protocol updates
+- Verifier attestations and consensus mechanisms
+- General Bitcoin transaction monitoring
+- Integration with bridge system for non-indexer operations
+
+### 3.2 Sequencer
 
 The Sequencer is responsible for processing transactions, creating L2 blocks, and aggregating them into L1 batches. It ensures transaction ordering, execution, and state transitions are performed correctly and efficiently.
 
@@ -68,7 +123,7 @@ The Sequencer functionality is distributed across several interconnected compone
 - **Mempool**: Stores pending transactions and provides them to the State Keeper
 - **Batch Executor**: Executes transactions within the VM and manages state updates
 - **Seal Criteria**: Determines when to seal L2 blocks and L1 batches
-- **BTC Sender**: Submits batch data to Bitcoin through inscriptions
+- **BTC Sender**: Submits batch data to Bitcoin through inscriptions with environment-based configuration
 
 ### 3.2 Prover
 
@@ -87,16 +142,40 @@ The Prover subsystem consists of several interconnected components:
 - **Circuit Prover**: Generates circuit proofs using GPU acceleration
 - **Proof Compressor**: "Wraps" the generated proof for submission to L1
 
-### 3.3 Verifier Network
+### 3.3 Bridge System
 
-The Verifier Network consists of multiple Verifier Nodes responsible for validating ZK proofs and ensuring the integrity of off-chain execution. These nodes attest to the validity of L2 state transitions before batches are finalized and withdrawals are processed.
+The Bridge System has been enhanced with new withdrawal processing capabilities and advanced transaction management:
+
+**Enhanced Features:**
+- **Bridge Withdrawal Inscriptions**: Support for bridge withdrawal inscription processing and validation
+- **Multi-Input Transaction Support**: Enhanced coordinator API for multiple inscription inputs per transaction
+- **UTXO Management**: Advanced UTXO sorting and selection algorithms with value-based ordering
+- **Transaction Validation**: Enhanced validation mechanisms for deposits and withdrawals
+
+**Components:**
+- **Deposit Processing**: L1→L2 transaction handling integrated with L1 Indexer system
+- **Withdrawal Processing**: L2→L1 transaction processing with inscription support and multi-input capabilities
+- **UTXO Manager**: Enhanced UTXO selection with descending value-based sorting for optimal transaction construction
+- **Transaction Builder**: Advanced transaction construction supporting multiple inputs and complex withdrawal scenarios
+
+### 3.4 Verifier Network
+
+The Verifier Network consists of multiple Verifier Nodes responsible for validating ZK proofs and ensuring the integrity of off-chain execution. The network has been enhanced with advanced multi-signature coordination capabilities.
 
 Key responsibilities:
-- ZK proof verification
+- ZK proof verification and validation
 - Data availability verification on Celestia
 - Bitcoin Merkle proof validation
 - Transaction attestation via Bitcoin inscriptions
-- Withdrawal processing using MuSig2
+- **Multi-Input Withdrawal Processing**: Enhanced withdrawal processing supporting multiple inscription inputs using MuSig2
+- **Coordinator API Integration**: Advanced partial signature management per input with improved session handling
+- **Nonce Management**: Enhanced nonce handling for multiple inputs and complex transaction scenarios
+
+**Enhanced Coordinator API Features:**
+- Request timeout handling with 30-second timeout limits
+- Enhanced partial signature validation and verification
+- Advanced session management with better state tracking
+- Comprehensive error handling and diagnostic logging
 
 The Verifier Network follows a distributed architecture with one node acting as a Coordinator, responsible for managing signing sessions and coordinating the MuSig2 process for transaction signing.
 

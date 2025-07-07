@@ -106,6 +106,396 @@ Key functionalities:
 - Handling errors and retries
 - Tracking metrics
 
+## L1 Indexer Integration
+
+The L1 Watchtower now integrates with the dedicated L1 Indexer service for enhanced Bitcoin blockchain monitoring and data management.
+
+### Architecture Integration
+
+The L1 Indexer operates as a complementary service to the traditional L1 Watchtower, providing specialized indexing capabilities:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Enhanced L1 Monitoring                             │
+│                                                                             │
+│  ┌─────────────────┐              ┌─────────────────┐                      │
+│  │   L1 Watcher    │              │   L1 Indexer    │                      │
+│  │   (Traditional) │◄────────────►│   (Dedicated)   │                      │
+│  │                 │              │                 │                      │
+│  │ • Inscription   │              │ • Deposit       │                      │
+│  │   Processing    │              │   Tracking      │                      │
+│  │ • Message       │              │ • Withdrawal    │                      │
+│  │   Validation    │              │   Monitoring    │                      │
+│  │ • Verifier      │              │ • UTXO          │                      │
+│  │   Coordination  │              │   Management    │                      │
+│  └─────────────────┘              └─────────────────┘                      │
+│           │                                │                               │
+│           ▼                                ▼                               │
+│  ┌─────────────────┐              ┌─────────────────┐                      │
+│  │ Main Database   │              │ L1 Indexer DB   │                      │
+│  │ • Transactions  │              │ • Deposits      │                      │
+│  │ • L1 Batches    │              │ • Withdrawals   │                      │
+│  │ • Events        │              │ • UTXOs         │                      │
+│  │ • Verifier Data │              │ • Metadata      │                      │
+│  └─────────────────┘              └─────────────────┘                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Dual-Service Operation
+
+The system now supports two operational modes:
+
+#### 1. Integrated Mode
+Both L1 Watcher and L1 Indexer run within the same process:
+
+```rust
+pub struct IntegratedL1Monitor {
+    watcher: VerifierBtcWatch,
+    indexer: L1IndexerService,
+    coordination_channel: mpsc::Receiver<IndexerEvent>,
+}
+
+impl IntegratedL1Monitor {
+    pub async fn new(config: &L1MonitorConfig) -> Result<Self, L1MonitorError> {
+        let (tx, rx) = mpsc::channel(1000);
+        
+        let watcher = VerifierBtcWatch::new(&config.watcher_config).await?;
+        let indexer = L1IndexerService::new(&config.indexer_config, tx).await?;
+        
+        Ok(Self {
+            watcher,
+            indexer,
+            coordination_channel: rx,
+        })
+    }
+    
+    pub async fn run(&mut self) -> Result<(), L1MonitorError> {
+        // Start both services concurrently
+        let watcher_handle = tokio::spawn(async move {
+            self.watcher.run().await
+        });
+        
+        let indexer_handle = tokio::spawn(async move {
+            self.indexer.run().await
+        });
+        
+        // Coordinate between services
+        let coordination_handle = tokio::spawn(async move {
+            self.coordinate_services().await
+        });
+        
+        // Wait for all services
+        tokio::try_join!(watcher_handle, indexer_handle, coordination_handle)?;
+        Ok(())
+    }
+    
+    async fn coordinate_services(&mut self) -> Result<(), L1MonitorError> {
+        while let Some(event) = self.coordination_channel.recv().await {
+            match event {
+                IndexerEvent::DepositDetected(deposit) => {
+                    // Notify watcher of new deposit for processing
+                    self.watcher.handle_deposit_event(deposit).await?;
+                }
+                IndexerEvent::WithdrawalProcessed(withdrawal) => {
+                    // Update watcher state with withdrawal information
+                    self.watcher.handle_withdrawal_event(withdrawal).await?;
+                }
+                IndexerEvent::BlockProcessed(block_height) => {
+                    // Synchronize block processing state
+                    self.watcher.sync_block_height(block_height).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+#### 2. Standalone Mode
+L1 Watcher and L1 Indexer run as separate services:
+
+```bash
+# Start L1 Indexer as standalone service
+via-indexer --config /path/to/l1_indexer.toml &
+
+# Start L1 Watcher with indexer integration
+via_server --components btc_watcher --l1-indexer-url http://localhost:8081
+```
+
+### Data Synchronization
+
+The L1 Watcher and L1 Indexer maintain synchronized state through several mechanisms:
+
+#### 1. Shared Block Height Tracking
+
+```rust
+pub struct BlockHeightSynchronizer {
+    watcher_client: Arc<WatcherClient>,
+    indexer_client: Arc<IndexerClient>,
+    sync_interval: Duration,
+}
+
+impl BlockHeightSynchronizer {
+    pub async fn synchronize_block_heights(&self) -> Result<(), SyncError> {
+        let watcher_height = self.watcher_client.get_last_processed_block().await?;
+        let indexer_height = self.indexer_client.get_last_processed_block().await?;
+        
+        match watcher_height.cmp(&indexer_height) {
+            std::cmp::Ordering::Greater => {
+                // Watcher is ahead, update indexer
+                self.indexer_client.sync_to_block(watcher_height).await?;
+            }
+            std::cmp::Ordering::Less => {
+                // Indexer is ahead, update watcher
+                self.watcher_client.sync_to_block(indexer_height).await?;
+            }
+            std::cmp::Ordering::Equal => {
+                // Heights are synchronized
+                tracing::debug!("Block heights synchronized at {}", watcher_height);
+            }
+        }
+        
+        Ok(())
+    }
+}
+```
+
+#### 2. Cross-Service Event Notification
+
+```rust
+#[derive(Debug, Clone)]
+pub enum CrossServiceEvent {
+    DepositDetected {
+        txid: Txid,
+        amount: u64,
+        l2_receiver: Address,
+        block_height: u32,
+    },
+    WithdrawalInitiated {
+        withdrawal_id: u64,
+        recipient: String,
+        amount: u64,
+        l2_batch: u64,
+    },
+    InscriptionProcessed {
+        txid: Txid,
+        inscription_data: String,
+        message_type: String,
+    },
+    BlockReorg {
+        old_tip: u32,
+        new_tip: u32,
+        affected_blocks: Vec<u32>,
+    },
+}
+
+pub struct EventBridge {
+    watcher_events: mpsc::Sender<CrossServiceEvent>,
+    indexer_events: mpsc::Sender<CrossServiceEvent>,
+}
+
+impl EventBridge {
+    pub async fn relay_event(&self, event: CrossServiceEvent) -> Result<(), EventBridgeError> {
+        // Send event to both services
+        self.watcher_events.send(event.clone()).await?;
+        self.indexer_events.send(event).await?;
+        Ok(())
+    }
+}
+```
+
+### Enhanced Message Processing
+
+The integration enables enhanced message processing capabilities:
+
+#### 1. Deposit Correlation
+
+```rust
+pub struct DepositCorrelator {
+    watcher_deposits: HashMap<Txid, WatcherDeposit>,
+    indexer_deposits: HashMap<Txid, IndexerDeposit>,
+}
+
+impl DepositCorrelator {
+    pub async fn correlate_deposits(&mut self) -> Result<Vec<CorrelatedDeposit>, CorrelationError> {
+        let mut correlated = Vec::new();
+        
+        for (txid, watcher_deposit) in &self.watcher_deposits {
+            if let Some(indexer_deposit) = self.indexer_deposits.get(txid) {
+                // Validate consistency between watcher and indexer data
+                if self.validate_deposit_consistency(watcher_deposit, indexer_deposit)? {
+                    correlated.push(CorrelatedDeposit {
+                        txid: *txid,
+                        watcher_data: watcher_deposit.clone(),
+                        indexer_data: indexer_deposit.clone(),
+                        correlation_status: CorrelationStatus::Validated,
+                    });
+                } else {
+                    tracing::warn!("Deposit data inconsistency detected for txid: {}", txid);
+                    correlated.push(CorrelatedDeposit {
+                        txid: *txid,
+                        watcher_data: watcher_deposit.clone(),
+                        indexer_data: indexer_deposit.clone(),
+                        correlation_status: CorrelationStatus::Inconsistent,
+                    });
+                }
+            }
+        }
+        
+        Ok(correlated)
+    }
+}
+```
+
+#### 2. Withdrawal Validation
+
+```rust
+pub struct WithdrawalValidator {
+    watcher_client: Arc<WatcherClient>,
+    indexer_client: Arc<IndexerClient>,
+}
+
+impl WithdrawalValidator {
+    pub async fn validate_withdrawal(
+        &self,
+        withdrawal_id: u64,
+    ) -> Result<WithdrawalValidationResult, ValidationError> {
+        // Get withdrawal data from both services
+        let watcher_withdrawal = self.watcher_client.get_withdrawal(withdrawal_id).await?;
+        let indexer_withdrawal = self.indexer_client.get_withdrawal(withdrawal_id).await?;
+        
+        // Cross-validate withdrawal data
+        let validation_checks = vec![
+            self.validate_withdrawal_amount(&watcher_withdrawal, &indexer_withdrawal),
+            self.validate_recipient_address(&watcher_withdrawal, &indexer_withdrawal),
+            self.validate_transaction_structure(&watcher_withdrawal, &indexer_withdrawal),
+            self.validate_signature_data(&watcher_withdrawal, &indexer_withdrawal),
+        ];
+        
+        let all_valid = validation_checks.iter().all(|&result| result);
+        
+        Ok(WithdrawalValidationResult {
+            withdrawal_id,
+            is_valid: all_valid,
+            validation_details: validation_checks,
+            watcher_data: watcher_withdrawal,
+            indexer_data: indexer_withdrawal,
+        })
+    }
+}
+```
+
+### Configuration Integration
+
+The integrated system supports unified configuration:
+
+```toml
+# etc/env/base/via_l1_monitor.toml
+
+[l1_monitor]
+mode = "integrated"  # "integrated" or "standalone"
+coordination_enabled = true
+sync_interval = 30   # seconds
+
+[watcher]
+poll_interval = 10
+confirmations_for_btc_msg = 6
+l1_blocks_chunk = 100
+restart_indexing = false
+
+[indexer]
+database_url = "postgresql://user:password@localhost/via_l1_indexer"
+batch_size = 100
+polling_interval = 10
+confirmation_blocks = 6
+
+[synchronization]
+block_height_sync_interval = 60
+event_bridge_buffer_size = 1000
+correlation_check_interval = 300
+```
+
+### Monitoring and Metrics
+
+Enhanced monitoring capabilities for the integrated system:
+
+```rust
+pub struct L1MonitorMetrics {
+    // Watcher metrics
+    pub watcher_blocks_processed: Counter,
+    pub watcher_messages_processed: Counter,
+    pub watcher_processing_time: Histogram,
+    
+    // Indexer metrics
+    pub indexer_blocks_processed: Counter,
+    pub indexer_deposits_found: Counter,
+    pub indexer_withdrawals_processed: Counter,
+    
+    // Integration metrics
+    pub sync_operations: Counter,
+    pub correlation_checks: Counter,
+    pub cross_service_events: Counter,
+    pub validation_failures: Counter,
+}
+
+impl L1MonitorMetrics {
+    pub fn record_sync_operation(&self, operation_type: &str, duration: Duration) {
+        self.sync_operations.inc();
+        // Record operation-specific metrics
+    }
+    
+    pub fn record_correlation_result(&self, result: CorrelationStatus) {
+        self.correlation_checks.inc();
+        match result {
+            CorrelationStatus::Validated => {
+                // Record successful correlation
+            }
+            CorrelationStatus::Inconsistent => {
+                self.validation_failures.inc();
+            }
+        }
+    }
+}
+```
+
+### Troubleshooting Integration Issues
+
+Common integration issues and solutions:
+
+#### 1. Block Height Desynchronization
+
+```bash
+# Check block heights
+curl http://localhost:8080/watcher/status | jq '.last_processed_block'
+curl http://localhost:8081/indexer/status | jq '.last_processed_block'
+
+# Force synchronization
+via-l1-monitor sync-block-heights --force
+```
+
+#### 2. Event Bridge Failures
+
+```bash
+# Check event bridge status
+via-l1-monitor check-event-bridge
+
+# Restart event bridge
+via-l1-monitor restart-event-bridge
+```
+
+#### 3. Data Correlation Issues
+
+```bash
+# Run correlation check
+via-l1-monitor correlate-deposits --from-block 100000 --to-block 100100
+
+# Validate withdrawal data
+via-l1-monitor validate-withdrawals --withdrawal-id 12345
+```
+
+This integration provides a robust, scalable solution for Bitcoin L1 monitoring while maintaining backward compatibility with existing L1 Watcher functionality.
+
+
 ## Scanning/Indexing Strategy
 
 The L1 Watchtower uses a polling-based approach to monitor the Bitcoin blockchain:

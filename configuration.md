@@ -2,17 +2,26 @@
 
 This document provides an overview of the key configuration files, environment variables, and parameters that significantly affect component behavior and deployment in the Via L2 Bitcoin ZK-Rollup system.
 
+**Recent Configuration Updates:**
+- **BTC Sender Configuration Refactoring**: Migration from hardcoded constants to environment variables
+- **L1 Indexer Configuration**: New configuration system for the dedicated indexer service
+- **Enhanced Environment Variable Support**: Comprehensive environment-based configuration management
+- **Database Configuration Expansion**: Support for multiple database connections including indexer database
+
 ## Table of Contents
 
 1. [Configuration Architecture](#configuration-architecture)
 2. [Global Configuration Files](#global-configuration-files)
 3. [Component-Specific Configuration](#component-specific-configuration)
 4. [Environment Variables](#environment-variables)
-5. [Docker Deployment Configuration](#docker-deployment-configuration)
-6. [Network Configuration](#network-configuration)
-7. [Wallet Configuration](#wallet-configuration)
-8. [Fee Management Configuration](#fee-management-configuration)
-9. [Server Component Selection](#server-component-selection)
+5. [BTC Sender Configuration](#btc-sender-configuration)
+6. [L1 Indexer Configuration](#l1-indexer-configuration)
+7. [Database Configuration](#database-configuration)
+8. [Docker Deployment Configuration](#docker-deployment-configuration)
+9. [Network Configuration](#network-configuration)
+10. [Wallet Configuration](#wallet-configuration)
+11. [Fee Management Configuration](#fee-management-configuration)
+12. [Server Component Selection](#server-component-selection)
 
 ## Configuration Architecture
 
@@ -444,3 +453,236 @@ export VIA_SERVER_COMPONENTS="sequencer,verifier"
 ## Conclusion
 
 The Via L2 Bitcoin ZK-Rollup system uses a comprehensive configuration system that allows for flexible deployment and operation. The wallet configuration system enables component-specific Bitcoin operations, while fee management ensures cost-effective transaction processing across different networks. Server component selection provides deployment flexibility for various operational requirements. By understanding the key configuration files, environment variables, and parameters, operators can effectively deploy and manage the system in various environments. The protocol version management system ensures smooth upgrades and backward compatibility.
+
+## L1 Indexer Configuration
+
+The L1 Indexer is a dedicated service that monitors Bitcoin L1 transactions and maintains synchronized state with the Via L2 system.
+
+### Database Configuration
+
+The L1 Indexer uses a dedicated database schema with the following tables:
+
+```sql
+-- Deposit tracking
+CREATE TABLE deposits (
+    id SERIAL PRIMARY KEY,
+    txid VARCHAR(64) NOT NULL,
+    vout INTEGER NOT NULL,
+    amount BIGINT NOT NULL,
+    address VARCHAR(100) NOT NULL,
+    block_height INTEGER,
+    confirmed BOOLEAN DEFAULT FALSE,
+    processed BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Bridge withdrawal tracking
+CREATE TABLE bridge_withdrawals (
+    id SERIAL PRIMARY KEY,
+    txid VARCHAR(64) NOT NULL,
+    inscription_data TEXT,
+    block_height INTEGER,
+    confirmed BOOLEAN DEFAULT FALSE,
+    processed BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Withdrawal tracking
+CREATE TABLE withdrawals (
+    id SERIAL PRIMARY KEY,
+    txid VARCHAR(64) NOT NULL,
+    amount BIGINT NOT NULL,
+    address VARCHAR(100) NOT NULL,
+    block_height INTEGER,
+    confirmed BOOLEAN DEFAULT FALSE,
+    processed BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Indexer metadata
+CREATE TABLE indexer_metadata (
+    key VARCHAR(50) PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+### Configuration Parameters
+
+The L1 Indexer is configured through environment variables and configuration files:
+
+#### Database Configuration
+```toml
+# etc/env/base/via_l1_indexer.toml
+database_url = "postgresql://user:password@localhost/via_l1_indexer"
+database_pool_size = 10
+```
+
+#### Bitcoin Node Configuration
+```toml
+# Bitcoin RPC connection
+btc_rpc_url = "http://localhost:8332"
+btc_rpc_user = "bitcoin"
+btc_rpc_password = "password"
+btc_network = "regtest"  # mainnet, testnet, regtest
+```
+
+#### Indexing Configuration
+```toml
+# Block processing configuration
+start_block_height = 0
+confirmation_blocks = 6
+batch_size = 100
+polling_interval = 10  # seconds
+
+# Bridge configuration
+bridge_address = "bc1qbridgeaddress..."
+inscription_prefix = "via:"
+```
+
+### Environment Variables
+
+Key environment variables for L1 Indexer configuration:
+
+#### Database Variables
+- `VIA_L1_INDEXER_DATABASE_URL`: PostgreSQL connection URL for the indexer database
+- `VIA_L1_INDEXER_DATABASE_POOL_SIZE`: Database connection pool size (default: 10)
+
+#### Bitcoin Node Variables
+- `VIA_L1_INDEXER_BTC_RPC_URL`: Bitcoin RPC URL
+- `VIA_L1_INDEXER_BTC_RPC_USER`: Bitcoin RPC username
+- `VIA_L1_INDEXER_BTC_RPC_PASSWORD`: Bitcoin RPC password
+- `VIA_L1_INDEXER_BTC_NETWORK`: Bitcoin network (mainnet/testnet/regtest)
+
+#### Processing Variables
+- `VIA_L1_INDEXER_START_BLOCK`: Starting block height for indexing
+- `VIA_L1_INDEXER_CONFIRMATION_BLOCKS`: Number of confirmation blocks required
+- `VIA_L1_INDEXER_BATCH_SIZE`: Number of blocks to process in each batch
+- `VIA_L1_INDEXER_POLLING_INTERVAL`: Polling interval in seconds
+
+#### Bridge Variables
+- `VIA_L1_INDEXER_BRIDGE_ADDRESS`: Bitcoin bridge address to monitor
+- `VIA_L1_INDEXER_INSCRIPTION_PREFIX`: Prefix for inscription data filtering
+
+### Service Configuration
+
+The L1 Indexer can be run as a standalone service or integrated with the main Via server:
+
+#### Standalone Service
+```bash
+# Run L1 Indexer as standalone service
+via-indexer --config /path/to/l1_indexer.toml
+
+# Run with specific components
+via-indexer --components deposit_monitor,withdrawal_processor
+```
+
+#### Integrated Service
+```bash
+# Run as part of main Via server
+via_server --components sequencer,verifier,l1_indexer
+```
+
+### Docker Configuration
+
+The L1 Indexer can be deployed using Docker:
+
+```yaml
+# docker-compose-l1-indexer.yml
+version: '3.8'
+services:
+  l1-indexer:
+    image: via/l1-indexer:latest
+    environment:
+      - VIA_L1_INDEXER_DATABASE_URL=postgresql://postgres:password@postgres:5432/via_l1_indexer
+      - VIA_L1_INDEXER_BTC_RPC_URL=http://bitcoind:8332
+      - VIA_L1_INDEXER_BTC_RPC_USER=bitcoin
+      - VIA_L1_INDEXER_BTC_RPC_PASSWORD=password
+      - VIA_L1_INDEXER_BTC_NETWORK=regtest
+    depends_on:
+      - postgres
+      - bitcoind
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=via_l1_indexer
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - l1_indexer_db:/var/lib/postgresql/data
+
+volumes:
+  l1_indexer_db:
+```
+
+### Monitoring and Health Checks
+
+The L1 Indexer provides health check endpoints and metrics:
+
+#### Health Check Endpoint
+```bash
+curl http://localhost:8080/health
+```
+
+#### Metrics Endpoint
+```bash
+curl http://localhost:8080/metrics
+```
+
+#### Key Metrics
+- `via_l1_indexer_blocks_processed_total`: Total blocks processed
+- `via_l1_indexer_deposits_found_total`: Total deposits found
+- `via_l1_indexer_withdrawals_processed_total`: Total withdrawals processed
+- `via_l1_indexer_last_processed_block`: Last processed block height
+- `via_l1_indexer_processing_lag_blocks`: Number of blocks behind tip
+
+### CLI Management
+
+The L1 Indexer provides CLI commands for management:
+
+```bash
+# Start the indexer
+via-indexer start
+
+# Stop the indexer
+via-indexer stop
+
+# Restart the indexer
+via-restart-indexer
+
+# Check indexer status
+via-indexer status
+
+# Reset indexer state (caution: destructive)
+via-indexer reset --confirm
+```
+
+### Troubleshooting
+
+Common configuration issues and solutions:
+
+#### Database Connection Issues
+```bash
+# Test database connection
+psql $VIA_L1_INDEXER_DATABASE_URL -c "SELECT 1;"
+
+# Check database schema
+via-indexer check-schema
+```
+
+#### Bitcoin Node Connection Issues
+```bash
+# Test Bitcoin RPC connection
+bitcoin-cli -rpcconnect=localhost -rpcport=8332 -rpcuser=bitcoin -rpcpassword=password getblockchaininfo
+
+# Check indexer Bitcoin connection
+via-indexer test-btc-connection
+```
+
+#### Performance Tuning
+- Increase `batch_size` for faster initial sync
+- Adjust `polling_interval` based on network requirements
+- Tune `database_pool_size` based on concurrent load
+- Use appropriate `confirmation_blocks` for security vs. speed trade-off
