@@ -95,6 +95,34 @@ Key functionalities:
 - Finalizing transactions based on verifier votes
 - Storing processed messages in the database
 
+#### Withdrawal Processor: multi-transaction disambiguation
+
+- The WithdrawalProcessor now supports multiple bridge transactions per batch using index_withdrawal (i64 LE) carried in the OP_RETURN BridgeWithdrawal message.
+- Lookup and update semantics:
+  - Resolves a triple (votable_tx_id, l1_batch_number, bridge_tx_id) by (proof_reveal_tx_id, index_withdrawal) to disambiguate multiple transactions in the same batch.
+    - See [via_verifier/node/via_btc_watch/src/message_processors/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_btc_watch/src/message_processors/withdrawal.rs)
+  - Updates are performed via ViaBridgeDal::update_bridge_tx(votable_tx_id, index_withdrawal, txid_bytes) rather than a legacy bridge_tx_id update on votes DAL.
+- Duplicate detection:
+  - If an unexpected duplicate mapping is detected for the same batch and index, the processor returns a SyncError to surface operator attention.
+- The Verifier message processor also normalizes the proof tx lookup to use raw bytes:
+  - ViaVotesDal::get_votable_transaction_id(&reveal_proof_txid.as_bytes()) in [via_verifier/node/via_btc_watch/src/message_processors/verifier.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_btc_watch/src/message_processors/verifier.rs)
+
+#### Governance upgrade processing (commits 076–077)
+
+- The watcher supports two-step governance upgrades:
+  1) Proposal inscription in a system transaction (witness-based) parsed as SystemContractUpgradeProposal.
+  2) Governance execution via a dedicated OP_RETURN transaction (prefix "VIA_PROTOCOL:UPGRADE") parsed as SystemContractUpgrade.
+- Indexer changes:
+  - extract_important_transactions now returns (gov_txs, system_txs, bridge_txs) and filters governance-address transactions.
+  - For each gov tx, the parser emits messages via [`rust MessageParser::parse_protocol_upgrade_transaction()`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs).
+  - Validity: [`rust BitcoinInscriptionIndexer::is_valid_gov_message()`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/mod.rs) checks the spending UTXO script_pubkey belongs to the governance address.
+- Processors:
+  - Core: GovernanceUpgradesEventProcessor fetches the referenced proposal tx, re-parses it into a SystemContractUpgradeProposal message set, and builds a `ProtocolUpgradeTx` using [`rust ViaProtocolUpgrade::create_protocol_upgrade_tx()`](https://github.com/vianetwork/via-core/blob/main/core/lib/types/src/via_protocol_upgrade.rs).
+  - Verifier: GovernanceUpgradesEventProcessor mirrors the same flow; BTC client is injected to load the proposal tx.
+- Data flow:
+  - Execution OP_RETURN contains the proposal_tx_id; inputs (OutPoints) provide provenance. The processor saves protocol version with tx via protocol_versions_dal.
+  - Development env: governance P2WPKH is provided via config (regtest Makefile updates the dev address).
+
 ### 4. BTC Watch (`VerifierBtcWatch`)
 
 Located in `via_verifier/node/via_btc_watch/src/lib.rs`, this component orchestrates the polling and processing of Bitcoin blocks.
@@ -105,396 +133,6 @@ Key functionalities:
 - Processing blocks to extract and handle messages
 - Handling errors and retries
 - Tracking metrics
-
-## L1 Indexer Integration
-
-The L1 Watchtower now integrates with the dedicated L1 Indexer service for enhanced Bitcoin blockchain monitoring and data management.
-
-### Architecture Integration
-
-The L1 Indexer operates as a complementary service to the traditional L1 Watchtower, providing specialized indexing capabilities:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          Enhanced L1 Monitoring                             │
-│                                                                             │
-│  ┌─────────────────┐              ┌─────────────────┐                      │
-│  │   L1 Watcher    │              │   L1 Indexer    │                      │
-│  │   (Traditional) │◄────────────►│   (Dedicated)   │                      │
-│  │                 │              │                 │                      │
-│  │ • Inscription   │              │ • Deposit       │                      │
-│  │   Processing    │              │   Tracking      │                      │
-│  │ • Message       │              │ • Withdrawal    │                      │
-│  │   Validation    │              │   Monitoring    │                      │
-│  │ • Verifier      │              │ • UTXO          │                      │
-│  │   Coordination  │              │   Management    │                      │
-│  └─────────────────┘              └─────────────────┘                      │
-│           │                                │                               │
-│           ▼                                ▼                               │
-│  ┌─────────────────┐              ┌─────────────────┐                      │
-│  │ Main Database   │              │ L1 Indexer DB   │                      │
-│  │ • Transactions  │              │ • Deposits      │                      │
-│  │ • L1 Batches    │              │ • Withdrawals   │                      │
-│  │ • Events        │              │ • UTXOs         │                      │
-│  │ • Verifier Data │              │ • Metadata      │                      │
-│  └─────────────────┘              └─────────────────┘                      │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Dual-Service Operation
-
-The system now supports two operational modes:
-
-#### 1. Integrated Mode
-Both L1 Watcher and L1 Indexer run within the same process:
-
-```rust
-pub struct IntegratedL1Monitor {
-    watcher: VerifierBtcWatch,
-    indexer: L1IndexerService,
-    coordination_channel: mpsc::Receiver<IndexerEvent>,
-}
-
-impl IntegratedL1Monitor {
-    pub async fn new(config: &L1MonitorConfig) -> Result<Self, L1MonitorError> {
-        let (tx, rx) = mpsc::channel(1000);
-        
-        let watcher = VerifierBtcWatch::new(&config.watcher_config).await?;
-        let indexer = L1IndexerService::new(&config.indexer_config, tx).await?;
-        
-        Ok(Self {
-            watcher,
-            indexer,
-            coordination_channel: rx,
-        })
-    }
-    
-    pub async fn run(&mut self) -> Result<(), L1MonitorError> {
-        // Start both services concurrently
-        let watcher_handle = tokio::spawn(async move {
-            self.watcher.run().await
-        });
-        
-        let indexer_handle = tokio::spawn(async move {
-            self.indexer.run().await
-        });
-        
-        // Coordinate between services
-        let coordination_handle = tokio::spawn(async move {
-            self.coordinate_services().await
-        });
-        
-        // Wait for all services
-        tokio::try_join!(watcher_handle, indexer_handle, coordination_handle)?;
-        Ok(())
-    }
-    
-    async fn coordinate_services(&mut self) -> Result<(), L1MonitorError> {
-        while let Some(event) = self.coordination_channel.recv().await {
-            match event {
-                IndexerEvent::DepositDetected(deposit) => {
-                    // Notify watcher of new deposit for processing
-                    self.watcher.handle_deposit_event(deposit).await?;
-                }
-                IndexerEvent::WithdrawalProcessed(withdrawal) => {
-                    // Update watcher state with withdrawal information
-                    self.watcher.handle_withdrawal_event(withdrawal).await?;
-                }
-                IndexerEvent::BlockProcessed(block_height) => {
-                    // Synchronize block processing state
-                    self.watcher.sync_block_height(block_height).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-```
-
-#### 2. Standalone Mode
-L1 Watcher and L1 Indexer run as separate services:
-
-```bash
-# Start L1 Indexer as standalone service
-via-indexer --config /path/to/l1_indexer.toml &
-
-# Start L1 Watcher with indexer integration
-via_server --components btc_watcher --l1-indexer-url http://localhost:8081
-```
-
-### Data Synchronization
-
-The L1 Watcher and L1 Indexer maintain synchronized state through several mechanisms:
-
-#### 1. Shared Block Height Tracking
-
-```rust
-pub struct BlockHeightSynchronizer {
-    watcher_client: Arc<WatcherClient>,
-    indexer_client: Arc<IndexerClient>,
-    sync_interval: Duration,
-}
-
-impl BlockHeightSynchronizer {
-    pub async fn synchronize_block_heights(&self) -> Result<(), SyncError> {
-        let watcher_height = self.watcher_client.get_last_processed_block().await?;
-        let indexer_height = self.indexer_client.get_last_processed_block().await?;
-        
-        match watcher_height.cmp(&indexer_height) {
-            std::cmp::Ordering::Greater => {
-                // Watcher is ahead, update indexer
-                self.indexer_client.sync_to_block(watcher_height).await?;
-            }
-            std::cmp::Ordering::Less => {
-                // Indexer is ahead, update watcher
-                self.watcher_client.sync_to_block(indexer_height).await?;
-            }
-            std::cmp::Ordering::Equal => {
-                // Heights are synchronized
-                tracing::debug!("Block heights synchronized at {}", watcher_height);
-            }
-        }
-        
-        Ok(())
-    }
-}
-```
-
-#### 2. Cross-Service Event Notification
-
-```rust
-#[derive(Debug, Clone)]
-pub enum CrossServiceEvent {
-    DepositDetected {
-        txid: Txid,
-        amount: u64,
-        l2_receiver: Address,
-        block_height: u32,
-    },
-    WithdrawalInitiated {
-        withdrawal_id: u64,
-        recipient: String,
-        amount: u64,
-        l2_batch: u64,
-    },
-    InscriptionProcessed {
-        txid: Txid,
-        inscription_data: String,
-        message_type: String,
-    },
-    BlockReorg {
-        old_tip: u32,
-        new_tip: u32,
-        affected_blocks: Vec<u32>,
-    },
-}
-
-pub struct EventBridge {
-    watcher_events: mpsc::Sender<CrossServiceEvent>,
-    indexer_events: mpsc::Sender<CrossServiceEvent>,
-}
-
-impl EventBridge {
-    pub async fn relay_event(&self, event: CrossServiceEvent) -> Result<(), EventBridgeError> {
-        // Send event to both services
-        self.watcher_events.send(event.clone()).await?;
-        self.indexer_events.send(event).await?;
-        Ok(())
-    }
-}
-```
-
-### Enhanced Message Processing
-
-The integration enables enhanced message processing capabilities:
-
-#### 1. Deposit Correlation
-
-```rust
-pub struct DepositCorrelator {
-    watcher_deposits: HashMap<Txid, WatcherDeposit>,
-    indexer_deposits: HashMap<Txid, IndexerDeposit>,
-}
-
-impl DepositCorrelator {
-    pub async fn correlate_deposits(&mut self) -> Result<Vec<CorrelatedDeposit>, CorrelationError> {
-        let mut correlated = Vec::new();
-        
-        for (txid, watcher_deposit) in &self.watcher_deposits {
-            if let Some(indexer_deposit) = self.indexer_deposits.get(txid) {
-                // Validate consistency between watcher and indexer data
-                if self.validate_deposit_consistency(watcher_deposit, indexer_deposit)? {
-                    correlated.push(CorrelatedDeposit {
-                        txid: *txid,
-                        watcher_data: watcher_deposit.clone(),
-                        indexer_data: indexer_deposit.clone(),
-                        correlation_status: CorrelationStatus::Validated,
-                    });
-                } else {
-                    tracing::warn!("Deposit data inconsistency detected for txid: {}", txid);
-                    correlated.push(CorrelatedDeposit {
-                        txid: *txid,
-                        watcher_data: watcher_deposit.clone(),
-                        indexer_data: indexer_deposit.clone(),
-                        correlation_status: CorrelationStatus::Inconsistent,
-                    });
-                }
-            }
-        }
-        
-        Ok(correlated)
-    }
-}
-```
-
-#### 2. Withdrawal Validation
-
-```rust
-pub struct WithdrawalValidator {
-    watcher_client: Arc<WatcherClient>,
-    indexer_client: Arc<IndexerClient>,
-}
-
-impl WithdrawalValidator {
-    pub async fn validate_withdrawal(
-        &self,
-        withdrawal_id: u64,
-    ) -> Result<WithdrawalValidationResult, ValidationError> {
-        // Get withdrawal data from both services
-        let watcher_withdrawal = self.watcher_client.get_withdrawal(withdrawal_id).await?;
-        let indexer_withdrawal = self.indexer_client.get_withdrawal(withdrawal_id).await?;
-        
-        // Cross-validate withdrawal data
-        let validation_checks = vec![
-            self.validate_withdrawal_amount(&watcher_withdrawal, &indexer_withdrawal),
-            self.validate_recipient_address(&watcher_withdrawal, &indexer_withdrawal),
-            self.validate_transaction_structure(&watcher_withdrawal, &indexer_withdrawal),
-            self.validate_signature_data(&watcher_withdrawal, &indexer_withdrawal),
-        ];
-        
-        let all_valid = validation_checks.iter().all(|&result| result);
-        
-        Ok(WithdrawalValidationResult {
-            withdrawal_id,
-            is_valid: all_valid,
-            validation_details: validation_checks,
-            watcher_data: watcher_withdrawal,
-            indexer_data: indexer_withdrawal,
-        })
-    }
-}
-```
-
-### Configuration Integration
-
-The integrated system supports unified configuration:
-
-```toml
-# etc/env/base/via_l1_monitor.toml
-
-[l1_monitor]
-mode = "integrated"  # "integrated" or "standalone"
-coordination_enabled = true
-sync_interval = 30   # seconds
-
-[watcher]
-poll_interval = 10
-confirmations_for_btc_msg = 6
-l1_blocks_chunk = 100
-restart_indexing = false
-
-[indexer]
-database_url = "postgresql://user:password@localhost/via_l1_indexer"
-batch_size = 100
-polling_interval = 10
-confirmation_blocks = 6
-
-[synchronization]
-block_height_sync_interval = 60
-event_bridge_buffer_size = 1000
-correlation_check_interval = 300
-```
-
-### Monitoring and Metrics
-
-Enhanced monitoring capabilities for the integrated system:
-
-```rust
-pub struct L1MonitorMetrics {
-    // Watcher metrics
-    pub watcher_blocks_processed: Counter,
-    pub watcher_messages_processed: Counter,
-    pub watcher_processing_time: Histogram,
-    
-    // Indexer metrics
-    pub indexer_blocks_processed: Counter,
-    pub indexer_deposits_found: Counter,
-    pub indexer_withdrawals_processed: Counter,
-    
-    // Integration metrics
-    pub sync_operations: Counter,
-    pub correlation_checks: Counter,
-    pub cross_service_events: Counter,
-    pub validation_failures: Counter,
-}
-
-impl L1MonitorMetrics {
-    pub fn record_sync_operation(&self, operation_type: &str, duration: Duration) {
-        self.sync_operations.inc();
-        // Record operation-specific metrics
-    }
-    
-    pub fn record_correlation_result(&self, result: CorrelationStatus) {
-        self.correlation_checks.inc();
-        match result {
-            CorrelationStatus::Validated => {
-                // Record successful correlation
-            }
-            CorrelationStatus::Inconsistent => {
-                self.validation_failures.inc();
-            }
-        }
-    }
-}
-```
-
-### Troubleshooting Integration Issues
-
-Common integration issues and solutions:
-
-#### 1. Block Height Desynchronization
-
-```bash
-# Check block heights
-curl http://localhost:8080/watcher/status | jq '.last_processed_block'
-curl http://localhost:8081/indexer/status | jq '.last_processed_block'
-
-# Force synchronization
-via-l1-monitor sync-block-heights --force
-```
-
-#### 2. Event Bridge Failures
-
-```bash
-# Check event bridge status
-via-l1-monitor check-event-bridge
-
-# Restart event bridge
-via-l1-monitor restart-event-bridge
-```
-
-#### 3. Data Correlation Issues
-
-```bash
-# Run correlation check
-via-l1-monitor correlate-deposits --from-block 100000 --to-block 100100
-
-# Validate withdrawal data
-via-l1-monitor validate-withdrawals --withdrawal-id 12345
-```
-
-This integration provides a robust, scalable solution for Bitcoin L1 monitoring while maintaining backward compatibility with existing L1 Watcher functionality.
-
 
 ## Scanning/Indexing Strategy
 
@@ -587,6 +225,50 @@ The system identifies relevant transactions by:
 - Checking transaction outputs for the bridge address
 - Parsing inscriptions and OP_RETURN data for Via protocol messages
 
+### Deterministic deposit PriorityOpId and metadata
+
+- Deposits now carry additional metadata extracted by the indexer:
+  - `tx_index`: transaction index within the Bitcoin block
+  - `output_vout`: output index (vout) within the transaction
+  - The indexer wraps transactions as [`TransactionWithMetadata`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/types.rs#L361) and plumbs `tx_index`/`output_vout` through the parsing pipeline:
+    - Parser updates: [`rust MessageParser::parse_bridge_transaction`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs#L197) and inscription/OP_RETURN extraction now set `tx_index`/`output_vout`.
+    - Extraction uses `TransactionWithMetadata` across system and bridge paths in [`rust BitcoinInscriptionIndexer::extract_important_transactions`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/mod.rs#L102).
+
+- PriorityOpId derivation (replaces sequential assignment):
+  - Deposits derive a stable priority id from (block, tx_index, vout) via [`rust ViaL1Deposit::priority_id`](https://github.com/vianetwork/via-core/blob/main/core/lib/types/src/l1/via_l1.rs#L34).
+  - Watchers no longer maintain a “next expected priority id” counter; processors construct deposits with required metadata and rely on `priority_id()`:
+    - Sequencer watcher: [`rust L1ToL2MessageProcessor::create_l1_tx_from_message`](https://github.com/vianetwork/via-core/blob/main/core/node/via_btc_watch/src/message_processors/l1_to_l2.rs#L110)
+    - Verifier watcher: [`rust L1ToL2MessageProcessor::create_l1_tx_from_message`](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_btc_watch/src/message_processors/l1_to_l2.rs#L56)
+    - Indexer-based ingestion in via_indexer aligns to the same scheme: [`rust L1ToL2MessageProcessor::create_l1_tx_from_message`](https://github.com/vianetwork/via-core/blob/main/via_indexer/node/indexer/src/message_processors/deposit.rs#L31)
+
+Operational implications:
+- Deterministic ordering: PriorityOpId is stable across replays and independent of in-memory counters.
+- Processors must ensure `tx_index` and `output_vout` are present on parsed messages; missing fields are treated as errors in the updated processors.
+## System wallets bootstrap and bridge configuration
+
+Initialization:
+- Main node adds a storage init layer that scans the configured bootstrap_txids, constructs SystemWallets (sequencer, verifiers, governance, bridge) and persists them in via_wallets.
+- Verifier nodes perform the same wallet initialization path during their storage init stage and expose the loaded wallets to downstream components (e.g., the indexer / watchers).
+
+System wallet updates at runtime:
+- A dedicated SystemWalletProcessor parses wallet update inscriptions (sequencer, governance and bridge update flows).
+- If the wallets set changes, the watcher re-processes the current block range to apply parsing/validation rules under the new wallet set (e.g., bridge address change affecting deposit classification).
+- BTC sender validates that the active inscriber address equals the sequencer address from SystemWallets before sending inscriptions.
+
+Bridge config:
+- The watcher and API use the dedicated bridge configuration (via_bridge.toml or VIA_BRIDGE_* env variables) for thresholds and wiring. The active bridge address is sourced from the DB (via_wallets) at runtime.
+
+Canonical chain gating (verifier watcher):
+- New insertion rules enforce strict sequential numbering and link-by-hash to the canonical head.
+- Duplicate proof reveal transactions are eliminated early via a proof_reveal_tx_exists check.
+- Operators can request a canonical chain continuity report (via DAL) to diagnose gaps and invalid links.
+
+External node:
+- External nodes can optionally run the BTC Watch in follower mode. When enabled, governance upgrade processing is disabled by configuration (the watcher still indexes L1ToL2 and votable messages).
+
+API signature changes in parser:
+- System transaction parsing accepts an optional wallets context; callers pass the loaded wallets when available.
+
 ## Data Processing and Storage
 
 After extracting messages from Bitcoin transactions, the L1 Watchtower processes and stores them:
@@ -614,6 +296,26 @@ The L1 Watchtower interacts with several other components in the Via L2 system:
 4. **Database** - The L1 Watchtower reads its starting block and persists its progress (last processed L1 block) in the `via_indexer_metadata` table.
 
 5. **State Keeper** - The L1-to-L2 messages processed by the L1 Watchtower are used by the State Keeper to update the L2 state.
+
+### Governance upgrade processing
+
+- Two-phase design:
+  - Proposal (witness-based): SystemContractUpgradeProposal is parsed from witness scripts in “system” transactions.
+  - Execution (OP_RETURN): SystemContractUpgrade is parsed from OP_RETURN outputs with prefix "VIA_PROTOCOL:UPGRADE", carrying the referenced proposal txid; inputs authorize governance execution.
+- Indexer extraction:
+  - The indexer classifies important txs as (gov_txs, system_txs, bridge_txs); gov_txs are outputs to the configured governance address. See [core/lib/via_btc_client/src/indexer/mod.rs](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/mod.rs).
+  - Validity checks ensure governance execution input belongs to the governance address (is_valid_gov_message). See [core/lib/via_btc_client/src/indexer/mod.rs](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/mod.rs).
+- Parsing:
+  - OP_RETURN execution: [core/lib/via_btc_client/src/indexer/parser.rs](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs)
+    - parse_protocol_upgrade_transaction() -> parse_op_return_protocol_upgrade() extracts proposal_tx_id and constructs a SystemContractUpgrade message including OutPoints.
+  - Proposal (witness): parse_system_transaction() continues to handle SystemContractUpgradeProposal in system transactions.
+- Watcher processors:
+  - Both Core and Verifier watchers wire a GovernanceUpgradesEventProcessor which now receives a BitcoinClient handle to fetch the referenced proposal transaction, and a MessageParser instance. See:
+    - [core/node/via_btc_watch/src/lib.rs](https://github.com/vianetwork/via-core/blob/main/core/node/via_btc_watch/src/lib.rs)
+    - [via_verifier/node/via_btc_watch/src/lib.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_btc_watch/src/lib.rs)
+  - The processor constructs the L2 ProtocolUpgradeTx using ViaProtocolUpgrade::create_protocol_upgrade_tx(), filling canonical_tx_hash with the L2 canonical transaction hash derived from the proposal. See [core/lib/types/src/via_protocol_upgrade.rs](https://github.com/vianetwork/via-core/blob/main/core/lib/types/src/via_protocol_upgrade.rs).
+- State changes:
+  - On acceptance, new protocol version and updated base system contracts hashes are saved via protocol_versions_dal.save_protocol_version_with_tx(...), enabling nodes to switch verification keys post-upgrade.
 
 ## Configuration Parameters
 
@@ -804,3 +506,25 @@ impl VerifierBtcWatch {
 The L1 Watchtower is a critical component of the Via L2 system, serving as the bridge between the Bitcoin L1 chain and the Layer 2 rollup. It monitors the Bitcoin blockchain for relevant events, processes them, and makes them available to other components of the system. Its polling-based approach, with configurable confirmation requirements, ensures reliable operation even in the face of chain reorganizations.
 
 The component is designed to be robust and efficient, with mechanisms for error handling, retries, and metrics tracking. It plays a crucial role in enabling the Via L2 system to leverage Bitcoin's security and decentralization while providing the scalability and functionality of a Layer 2 solution.
+
+---
+
+## Priority OpId Encoding
+
+- PriorityOpId encoding and dedicated type
+  - The encoding moved to a dedicated type with revised bit distribution: 28 bits for block_number, 20 bits for tx_index, 16 bits for vout. See [`core/lib/types/src/l1/priority_id.rs`](https://github.com/vianetwork/via-core/blob/main/core/lib/types/src/l1/priority_id.rs).
+  - Deposits now build their priority id using this type; see [`core/lib/types/src/l1/via_l1.rs`](https://github.com/vianetwork/via-core/blob/main/core/lib/types/src/l1/via_l1.rs).
+  - Ordering semantics are unchanged: the raw u64 remains the sort key for deterministic ordering and replayability.
+
+- Async bridge-withdrawal validation in the indexer
+  - Bridge withdrawals are validated against the BTC node: the indexer fetches the referenced input UTXO and checks that its script_pubkey equals the configured bridge address. See [`core/lib/via_btc_client/src/indexer/mod.rs`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/mod.rs).
+  - Note: In the “process_block” example above, the filter line is illustrative; the actual implementation performs async checks in a loop prior to collecting valid messages.
+
+- OP_RETURN parsing offset fix
+  - The start offset to read the proof reveal txid from OP_RETURN data was corrected to begin after the prefix and a single delimiter byte (+1). See [`core/lib/via_btc_client/src/indexer/parser.rs:775`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs#L775).
+
+- Removal of sequential priority-id tracking in the indexer ingestion path
+  - The via_indexer L1→L2 processor no longer keeps a “next expected priority id” counter; deposits rely entirely on deterministic derivation from on-chain metadata. See [`via_indexer/node/indexer/src/message_processors/deposit.rs`](https://github.com/vianetwork/via-core/blob/main/via_indexer/node/indexer/src/message_processors/deposit.rs).
+
+- Database schema note for withdrawals table
+  - The indexer DAL dropped the UNIQUE constraint on bridge_withdrawals.block_number to allow multiple withdrawal bundles per block. See [`via_indexer/lib/via_indexer_dal/migrations/20250604191948_deposit_withdraw.up.sql`](https://github.com/vianetwork/via-core/blob/main/via_indexer/lib/via_indexer_dal/migrations/20250604191948_deposit_withdraw.up.sql).

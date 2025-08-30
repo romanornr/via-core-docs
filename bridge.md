@@ -297,6 +297,8 @@ The L2 contract emits a log that is included in the L2 batch data, which is then
 
 ### Withdrawal Processing
 
+For fee distribution semantics and empty-transaction behavior details, see [withdrawal_finalization.md](withdrawal_finalization.md).
+
 The withdrawal process involves several steps:
 
 1. **Withdrawal Detection**: The `WithdrawalClient` in `via_verifier/lib/via_withdrawal_client/src/client.rs` fetches withdrawal requests from the data availability layer.
@@ -311,7 +313,28 @@ pub async fn get_withdrawals(&self, blob_id: &str) -> anyhow::Result<Vec<Withdra
 }
 ```
 
-2. **Withdrawal Session Creation**: The `WithdrawalSession` in `via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs` creates a withdrawal session for processing.
+2. **Session Timeout Management**: The coordinator implements session timeout functionality to manage concurrent sessions and prevent deadlocks:
+
+```rust
+pub async fn is_session_timeout(&self) -> bool {
+    let created_at = self.state.signing_session.read().await.created_at.clone();
+    created_at + self.state.session_timeout < seconds_since_epoch()
+}
+```
+
+**Session Timeout Features:**
+- **Configurable Timeout**: Session timeout is configurable via `session_timeout` parameter (default: 30 seconds)
+- **Automatic Cleanup**: Sessions that exceed the timeout are automatically cleaned up
+- **Concurrent Session Management**: Prevents new sessions from starting while active sessions are in progress
+- **Deadlock Prevention**: Ensures that stuck sessions don't block the system indefinitely
+
+**Configuration:**
+```toml
+# etc/env/base/via_verifier.toml
+session_timeout = 30  # Session timeout in seconds
+```
+
+3. **Withdrawal Session Creation**: The `WithdrawalSession` in `via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs` creates a withdrawal session for processing.
 
 ```rust
 async fn session(&self) -> anyhow::Result<Option<SessionOperation>> {
@@ -340,21 +363,23 @@ async fn session(&self) -> anyhow::Result<Option<SessionOperation>> {
 ```rust
 pub async fn build_transaction_with_op_return(
     &self,
-    mut outputs: Vec<TxOut>,
+    outputs: Vec<TxOut>,
     op_return_prefix: &[u8],
-    op_return_data: Vec<[u8; 32]>,
-) -> Result<UnsignedBridgeTx> {
+    op_return_data: Vec<&Vec<u8>>,
+    fee_strategy: Arc<dyn FeeStrategy>,
+    change_output: Option<TxOut>,
+    max_outputs_per_tx: Option<usize>,
+    weight_limit: u64,
+) -> anyhow::Result<Vec<UnsignedBridgeTx>> {
     // ...
-    
-    // Create OP_RETURN output with proof txid
-    let op_return_data =
+    // Create OP_RETURN output script from prefix and data
+    let op_return_script =
         TransactionBuilder::create_op_return_script(op_return_prefix, op_return_data)?;
 
     let op_return_output = TxOut {
         value: Amount::ZERO,
-        script_pubkey: op_return_data,
+        script_pubkey: op_return_script,
     };
-    
     // ...
 }
 ```
@@ -382,256 +407,6 @@ async fn build_and_broadcast_final_transaction(
     
     // ...
 }
-```
-
-
-### Enhanced Withdrawal Inscription Processing
-
-The bridge now supports advanced withdrawal inscription processing with multi-input transaction capabilities for improved efficiency and UTXO management.
-
-#### Inscription-Based Withdrawal Detection
-
-The system can now process withdrawal inscriptions embedded in Bitcoin transactions, providing enhanced metadata and processing capabilities:
-
-```rust
-pub struct WithdrawalInscriptionProcessor {
-    inscription_parser: InscriptionParser,
-    withdrawal_validator: WithdrawalValidator,
-    multi_input_handler: MultiInputTransactionHandler,
-}
-
-impl WithdrawalInscriptionProcessor {
-    pub async fn process_withdrawal_inscriptions(
-        &self,
-        block_transactions: &[BitcoinTransaction],
-    ) -> Result<Vec<WithdrawalInscription>, ProcessingError> {
-        let mut withdrawal_inscriptions = Vec::new();
-        
-        for tx in block_transactions {
-            // Check for withdrawal inscriptions in transaction inputs
-            for (input_index, input) in tx.input.iter().enumerate() {
-                if let Some(inscription_data) = self.extract_inscription_from_input(input).await? {
-                    if let Some(withdrawal) = self.parse_withdrawal_inscription(&inscription_data)? {
-                        withdrawal_inscriptions.push(WithdrawalInscription {
-                            txid: tx.txid(),
-                            input_index,
-                            withdrawal_data: withdrawal,
-                            block_height: self.current_block_height,
-                            processed: false,
-                        });
-                    }
-                }
-            }
-        }
-        
-        Ok(withdrawal_inscriptions)
-    }
-    
-    async fn extract_inscription_from_input(
-        &self,
-        input: &TxIn,
-    ) -> Result<Option<InscriptionData>, ProcessingError> {
-        // Extract inscription data from transaction input witness
-        if let Some(witness) = &input.witness {
-            for witness_item in witness.iter() {
-                if let Ok(inscription) = self.inscription_parser.parse_witness_data(witness_item) {
-                    if inscription.content_type == "application/json" {
-                        return Ok(Some(inscription));
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-}
-```
-
-#### Multi-Input Transaction Support
-
-The bridge now supports processing transactions with multiple inputs, enabling more efficient UTXO consolidation and batch withdrawal processing:
-
-```rust
-pub struct MultiInputTransactionHandler {
-    utxo_selector: UtxoSelector,
-    fee_estimator: FeeEstimator,
-    transaction_builder: TransactionBuilder,
-}
-
-impl MultiInputTransactionHandler {
-    pub async fn build_multi_input_withdrawal_tx(
-        &self,
-        withdrawals: Vec<WithdrawalRequest>,
-        available_utxos: Vec<Utxo>,
-    ) -> Result<UnsignedBridgeTx, TransactionBuildError> {
-        // Select optimal UTXOs for the transaction
-        let selected_utxos = self.utxo_selector
-            .select_utxos_for_withdrawals(&withdrawals, &available_utxos)
-            .await?;
-        
-        // Build transaction with multiple inputs
-        let mut tx_builder = self.transaction_builder.new_transaction();
-        
-        // Add inputs from selected UTXOs
-        for utxo in &selected_utxos {
-            tx_builder.add_input(TxIn {
-                previous_output: OutPoint {
-                    txid: utxo.txid,
-                    vout: utxo.vout,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            });
-        }
-        
-        // Add outputs for each withdrawal
-        for withdrawal in &withdrawals {
-            tx_builder.add_output(TxOut {
-                value: Amount::from_sat(withdrawal.amount),
-                script_pubkey: withdrawal.recipient_address.script_pubkey(),
-            });
-        }
-        
-        // Add change output if necessary
-        let total_input = selected_utxos.iter().map(|u| u.value).sum::<u64>();
-        let total_output = withdrawals.iter().map(|w| w.amount).sum::<u64>();
-        let estimated_fee = self.fee_estimator.estimate_fee(&tx_builder).await?;
-        
-        if total_input > total_output + estimated_fee {
-            let change_amount = total_input - total_output - estimated_fee;
-            tx_builder.add_output(TxOut {
-                value: Amount::from_sat(change_amount),
-                script_pubkey: self.get_change_address().script_pubkey(),
-            });
-        }
-        
-        // Add OP_RETURN output with withdrawal metadata
-        let withdrawal_metadata = self.create_withdrawal_metadata(&withdrawals)?;
-        tx_builder.add_output(TxOut {
-            value: Amount::ZERO,
-            script_pubkey: self.create_op_return_script(&withdrawal_metadata)?,
-        });
-        
-        Ok(tx_builder.build_unsigned())
-    }
-}
-```
-
-#### Enhanced UTXO Selection Algorithm
-
-The bridge implements an improved UTXO selection algorithm that prioritizes larger UTXOs for efficient transaction building:
-
-```rust
-pub struct UtxoSelector {
-    selection_strategy: UtxoSelectionStrategy,
-    dust_threshold: Amount,
-}
-
-impl UtxoSelector {
-    pub async fn select_utxos_for_withdrawals(
-        &self,
-        withdrawals: &[WithdrawalRequest],
-        available_utxos: &[Utxo],
-    ) -> Result<Vec<Utxo>, UtxoSelectionError> {
-        let total_required = withdrawals.iter().map(|w| w.amount).sum::<u64>();
-        let estimated_fee = self.estimate_transaction_fee(withdrawals.len(), available_utxos.len()).await?;
-        let target_amount = total_required + estimated_fee;
-        
-        // Sort UTXOs by value in descending order for efficient selection
-        let mut sorted_utxos = available_utxos.to_vec();
-        sorted_utxos.sort_by(|a, b| b.value.cmp(&a.value));
-        
-        let mut selected_utxos = Vec::new();
-        let mut selected_value = 0u64;
-        
-        // Select UTXOs using largest-first strategy
-        for utxo in sorted_utxos {
-            if utxo.value < self.dust_threshold.to_sat() {
-                continue; // Skip dust UTXOs
-            }
-            
-            selected_utxos.push(utxo);
-            selected_value += utxo.value;
-            
-            if selected_value >= target_amount {
-                break;
-            }
-        }
-        
-        if selected_value < target_amount {
-            return Err(UtxoSelectionError::InsufficientFunds {
-                required: target_amount,
-                available: selected_value,
-            });
-        }
-        
-        Ok(selected_utxos)
-    }
-    
-    async fn estimate_transaction_fee(
-        &self,
-        num_outputs: usize,
-        num_inputs: usize,
-    ) -> Result<u64, FeeEstimationError> {
-        // Estimate transaction size: inputs (148 bytes each) + outputs (34 bytes each) + overhead (10 bytes)
-        let estimated_size = (num_inputs * 148) + (num_outputs * 34) + 10;
-        let fee_rate = self.get_current_fee_rate().await?;
-        Ok((estimated_size as u64) * fee_rate)
-    }
-}
-```
-
-#### Withdrawal Inscription Format
-
-Withdrawal inscriptions follow a standardized JSON format for consistency and parsing efficiency:
-
-```json
-{
-  "protocol": "via",
-  "operation": "withdrawal",
-  "version": "1.0",
-  "data": {
-    "recipient": "bc1qrecipientaddress...",
-    "amount": 1000000,
-    "l2_batch_number": 12345,
-    "withdrawal_index": 0,
-    "proof_hash": "0x1234567890abcdef...",
-    "timestamp": 1640995200
-  },
-  "signature": "0xsignature..."
-}
-```
-
-#### Processing Workflow
-
-The enhanced withdrawal processing follows this workflow:
-
-1. **Inscription Detection**: Monitor Bitcoin transactions for withdrawal inscriptions
-2. **Multi-Input Analysis**: Analyze transactions with multiple inputs for batch processing
-3. **UTXO Selection**: Select optimal UTXOs using the enhanced selection algorithm
-4. **Transaction Building**: Build multi-input transactions with proper fee estimation
-5. **Signature Coordination**: Coordinate MuSig2 signatures among verifiers
-6. **Broadcasting**: Broadcast the signed transaction to the Bitcoin network
-7. **Confirmation Tracking**: Track transaction confirmations and update withdrawal status
-
-#### Configuration Parameters
-
-The enhanced withdrawal processing can be configured through environment variables:
-
-```bash
-# Multi-input transaction settings
-export VIA_BRIDGE_MAX_INPUTS_PER_TX=10
-export VIA_BRIDGE_DUST_THRESHOLD=546
-export VIA_BRIDGE_UTXO_SELECTION_STRATEGY="largest_first"
-
-# Inscription processing settings
-export VIA_BRIDGE_INSCRIPTION_CONTENT_TYPE="application/json"
-export VIA_BRIDGE_INSCRIPTION_MAX_SIZE=1024
-
-# Fee estimation settings
-export VIA_BRIDGE_FEE_RATE_MULTIPLIER=1.1
-export VIA_BRIDGE_MIN_FEE_RATE=1
-export VIA_BRIDGE_MAX_FEE_RATE=100
 ```
 
 5. **Transaction Broadcasting**: Once enough verifiers have signed, the coordinator broadcasts the transaction to the Bitcoin network.
@@ -675,7 +450,7 @@ fn process_bootstrap_message(
 
 ## Bitcoin Client Resource Layer Integration
 
-The bridge now supports enhanced Bitcoin client resource management with multiple client instances for improved reliability and performance:
+The bridge supports enhanced Bitcoin client resource management with multiple client instances for improved reliability and performance:
 
 ### Multiple Bitcoin Client Support
 
@@ -738,7 +513,7 @@ impl BitcoinClientResourcePool {
 
 ### Separation of Concerns
 
-The bridge now clearly separates different operational roles:
+The bridge clearly separates different operational roles:
 
 - **Sender Role**: Handles transaction broadcasting and fee management
 - **Verifier Role**: Manages transaction verification and validation
@@ -869,6 +644,73 @@ impl WalletUtxoManager {
     }
 }
 ```
+
+### Bridge Withdrawal Validation and Indexing
+
+This release adds a full validation and indexing path for bridge withdrawals on Bitcoin. The system validates that withdrawal transactions actually originate from the bridge address, processes withdrawal inscriptions, and persists them with detailed metadata.
+
+- Withdrawal origin validation
+  - The indexer validates that the first input being spent belongs to the bridge wallet by matching the script_pubkey:
+    - [BitcoinInscriptionIndexer::is_valid_bridge_withdrawal()](core/lib/via_btc_client/src/indexer/mod.rs:376)
+  - The standalone L1 indexer processor also enforces this during withdrawal message processing by verifying each input's script_pubkey against the bridge:
+    - Script pubkey check: [via_indexer/node/indexer/src/message_processors/withdrawal.rs](via_indexer/node/indexer/src/message_processors/withdrawal.rs:63)
+
+- Withdrawal message processor (Indexer layer)
+  - The indexer processes BridgeWithdrawal inscriptions and extracts transaction metadata:
+    - Main loop: [WithdrawalProcessor::process_messages()](via_indexer/node/indexer/src/message_processors/withdrawal.rs:31)
+    - Bridge tx id bytes handling (LE/BE): [via_indexer/node/indexer/src/message_processors/withdrawal.rs](via_indexer/node/indexer/src/message_processors/withdrawal.rs:41)
+    - Proof reveal tx id bytes handling (LE/BE): [via_indexer/node/indexer/src/message_processors/withdrawal.rs](via_indexer/node/indexer/src/message_processors/withdrawal.rs:74)
+  - It computes the transaction fee as total input value minus output amount and captures vsize/total_size:
+    - Fee computation and sizing capture: [via_indexer/node/indexer/src/message_processors/withdrawal.rs](via_indexer/node/indexer/src/message_processors/withdrawal.rs:72)
+  - Each per-recipient withdrawal is normalized into indexed entries:
+    - WithdrawalParam creation: [via_indexer/node/indexer/src/message_processors/withdrawal.rs](via_indexer/node/indexer/src/message_processors/withdrawal.rs:89)
+
+- DAL helpers and database persistence
+  - Data models for bridge withdrawals:
+- OP_RETURN schema update
+  - BridgeWithdrawal OP_RETURN now supports an optional index_withdrawal (i64 LE).
+  - When present, it is parsed from OP_RETURN and attached to BridgeWithdrawalInput; when absent, it is treated as 0.
+  - Parser and typing references: [MessageParser.parse_withdrawal()](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs#L800), [BridgeWithdrawalInput.index_withdrawal](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/types.rs#L57).
+  - Canonical OP_RETURN layout is documented in [inscription_interaction.md](inscription_interaction.md).
+    - [BridgeWithdrawalParam](via_indexer/lib/via_indexer_dal/src/models/withdraw.rs:2)
+    - [WithdrawalParam](via_indexer/lib/via_indexer_dal/src/models/withdraw.rs:13)
+  - The DAL exposes a single insertion API that persists the bridge withdrawal row along with all constituent withdrawals:
+    - [ViaTransactionsDal::insert_withdraw()](https://github.com/vianetwork/via-core/blob/main/via_indexer/lib/via_indexer_dal/src/via_transactions_dal.rs#L113)
+  - Persisted fields include:
+    - Bridge withdrawal: tx_id, l1_batch_reveal_tx_id, block_number, fee, vsize, total_size, withdrawals_count
+      - Insert SQL: [via_indexer/lib/via_indexer_dal/src/via_transactions_dal.rs](https://github.com/vianetwork/via-core/blob/main/via_indexer/lib/via_indexer_dal/src/via_transactions_dal.rs#L126)
+    - Individual withdrawals: tx_index, receiver, value
+      - Insert SQL: [via_indexer/lib/via_indexer_dal/src/via_transactions_dal.rs](https://github.com/vianetwork/via-core/blob/main/via_indexer/lib/via_indexer_dal/src/via_transactions_dal.rs#L147)
+  - The processor finalizes by inserting the fully-formed withdrawal into the DAL:
+    - [via_indexer/node/indexer/src/message_processors/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_indexer/node/indexer/src/message_processors/withdrawal.rs#L105)
+
+- Where this integrates in the overall withdrawal flow
+  - After L1 detection and validation, the coordinator builds unsigned transactions and coordinates MuSig2 signing as documented above.
+  - For fee logic, see the new Withdrawal Fee Strategy section in the fee documentation:
+    - [fee_mechanism.md](fee_mechanism.md)
+
+## Bridge configuration separation and wallets bootstrap
+
+- Bridge parameters (coordinator key, verifier keys, bridge address, thresholds) are provided by a dedicated bridge configuration (via_bridge.toml or VIA_BRIDGE_*), not by genesis.
+- On startup, nodes derive and persist SystemWallets by scanning bootstrap transactions; consumers (indexer, watchers) use these addresses for validation and parsing.
+- The active bridge address is retrieved from the database at runtime by the API and watchers.
+- Verifier configuration optionally accepts a bridge address merkle root to validate Taproot tree membership when required.
+
+System wallet update flows
+
+- Updates to sequencer, governance and bridge follow the same governance execution pattern used for protocol upgrades:
+  - Proposals are witness-based inscriptions (for bridge updates: UpdateBridgeProposal with new MuSig2 address and verifier set).
+  - Executions are OP_RETURN transactions signed from governance, with ASCII prefixes:
+    - "VIA_PROTOCOL:SEQ" (sequencer), "VIA_PROTOCOL:GOV" (governance) and "VIA_PROTOCOL:BRI" (bridge), plus the appropriate payload (address or proposal txid).
+- The watcher persists the new SystemWallets and immediately applies them to subsequent parsing (e.g., deposit detection uses the new bridge address).
+
+Transferring UTXOs from the old bridge
+
+- Governance-controlled script path allows consolidating or relocating UTXOs from the old bridge address to a governance wallet.
+- Example utilities:
+  - Compute aggregate keys / governance script: [rust compute_musig2.rs](via_verifier/lib/via_musig2/examples/compute_musig2.rs)
+  - Transfer UTXOs via governance script path: [rust transfer_utxos_from_bridge.rs](via_verifier/lib/via_musig2/examples/transfer_utxos_from_bridge.rs)
+- Operator runbook and examples are provided in the upgrade guide under “Transfer the UTXOs from the old bridge address”.
 
 ## Database Query Improvements
 
@@ -1346,3 +1188,60 @@ The system's comprehensive architecture provides robust functionality through:
 8. **Operational Excellence**: Detailed operational guidelines, troubleshooting procedures, and best practices
 
 These features ensure the bridge operates with optimal security, reliability, and operational efficiency while maintaining the core principles of decentralization and transparency that are fundamental to the Via L2 system.
+### Bridge Transaction IDs: Coordinator DAL Helpers and Flow
+
+This release introduces dedicated DAL helpers for persisting and tracking bridge transaction IDs associated with withdrawal sessions. These helpers allow the Coordinator to:
+- Store unsigned bridge transactions for a votable transaction
+- Retrieve the stored unsigned transactions for a session
+- Update a stored entry with the final broadcast txid once signing and broadcast succeed
+- Create no-op records when a finalized batch has no withdrawals
+
+Key components and call sites:
+- Coordinator workflow
+  - After building unsigned transactions, the session stores all variants for the votable transaction:
+    - Call site: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs#L492)
+    - DAL method: [ViaBridgeDal::insert_bridge_txs()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/src/via_bridge.rs#L11)
+  - To resume a session, the Coordinator loads the stored unsigned transactions. The entry with an empty hash indicates the candidate to be signed:
+    - Call site: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs#L292)
+    - DAL method: [ViaBridgeDal::get_vote_transaction_bridge_txs()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/src/via_bridge.rs#L91)
+  - After broadcasting the final signed transaction, the session updates the record with the actual txid hash:
+    - Call site: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs#L181)
+    - DAL method: [ViaBridgeDal::update_bridge_tx()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/src/via_bridge.rs#L64)
+  - For finalized batches that contain no withdrawals, the session records a no-op entry (index 0) to mark the batch processed:
+    - Call site: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs#L246)
+    - DAL method: [`rust ViaBridgeDal::update_bridge_tx()`](via_verifier/lib/verifier_dal/src/via_bridge.rs) with a zero hash
+
+- Votable transaction lookup
+  - The Coordinator resolves the votable transaction ID from the proof reveal txid bytes:
+    - Call site: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs:505)
+    - DAL method: [ViaVotesDal::get_votable_transaction_id()](via_verifier/lib/verifier_dal/src/via_votes_dal.rs:57)
+
+Data model semantics:
+- Multiple unsigned bridge transactions may be stored for a single votable transaction (e.g., weight splits or alternatives)
+- Each stored row has:
+  - data: the serialized unsigned bridge transaction bytes
+  - index: the position within the set for deterministic retrieval
+  - hash: empty until a final signed transaction is broadcast, then updated with the txid
+- Retrieval is ordered by insertion, enabling the Coordinator to pick the entry with an empty hash as the current candidate
+
+- Migration: [via_verifier/lib/verifier_dal/migrations/20250714093607_bridge_tx.up.sql](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/migrations/20250714093607_bridge_tx.up.sql)
+  - Unique constraints: (`votable_tx_id`, `index`) is unique (hash is not unique).
+
+Cross-reference:
+- Fee-aware construction and validation of withdrawals, including fee rate tolerance and output filtering, are described in the fee mechanism:
+  - See Fee Strategy section: [fee_mechanism.md](fee_mechanism.md)
+
+---
+
+## Deterministic PriorityOpId (deposits) — updated encoding
+
+- Deposits now derive a deterministic PriorityOpId from Bitcoin L1 metadata: `(block_number, tx_index, output_vout)` provided by the indexer. This removes the need for any sequential counters in watchers or indexer ingestion paths.
+- Encoding and type:
+  - Bit distribution updated to 28 bits for block_number, 20 bits for tx_index, and 16 bits for vout, encapsulated by [`rust ViaPriorityOpId::new()`](https://github.com/vianetwork/via-core/blob/main/core/lib/types/src/l1/priority_id.rs#L60).
+  - The deposit serial id is produced via [`rust ViaL1Deposit::priority_id()`](https://github.com/vianetwork/via-core/blob/main/core/lib/types/src/l1/via_l1.rs#L269), which wraps the raw u64 from the dedicated type.
+  - This supersedes the earlier 28/24/12 layout; ordering semantics remain by u64 comparison for stable replay.
+- Indexer requirements:
+  - The indexer must attach `tx_index` and `output_vout` when parsing deposits so the bridge can derive the id deterministically. See transport metadata plumbed via `TransactionWithMetadata` in [core/lib/via_btc_client/src/indexer/](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/).
+- Operational implications:
+  - Stable, replayable ordering of deposits across restarts/reindexing.
+  - Ingestion paths no longer maintain “next expected priority id” state; the via_indexer deposit processor was simplified accordingly (see [via_indexer/node/indexer/src/message_processors/deposit.rs](https://github.com/vianetwork/via-core/blob/main/via_indexer/node/indexer/src/message_processors/deposit.rs)).

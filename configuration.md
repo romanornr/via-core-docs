@@ -2,26 +2,19 @@
 
 This document provides an overview of the key configuration files, environment variables, and parameters that significantly affect component behavior and deployment in the Via L2 Bitcoin ZK-Rollup system.
 
-**Recent Configuration Updates:**
-- **BTC Sender Configuration Refactoring**: Migration from hardcoded constants to environment variables
-- **L1 Indexer Configuration**: New configuration system for the dedicated indexer service
-- **Enhanced Environment Variable Support**: Comprehensive environment-based configuration management
-- **Database Configuration Expansion**: Support for multiple database connections including indexer database
-
 ## Table of Contents
 
 1. [Configuration Architecture](#configuration-architecture)
 2. [Global Configuration Files](#global-configuration-files)
 3. [Component-Specific Configuration](#component-specific-configuration)
 4. [Environment Variables](#environment-variables)
-5. [BTC Sender Configuration](#btc-sender-configuration)
-6. [L1 Indexer Configuration](#l1-indexer-configuration)
-7. [Database Configuration](#database-configuration)
-8. [Docker Deployment Configuration](#docker-deployment-configuration)
-9. [Network Configuration](#network-configuration)
-10. [Wallet Configuration](#wallet-configuration)
-11. [Fee Management Configuration](#fee-management-configuration)
-12. [Server Component Selection](#server-component-selection)
+5. [Docker Deployment Configuration](#docker-deployment-configuration)
+6. [Network Configuration](#network-configuration)
+7. [Wallet Configuration](#wallet-configuration)
+8. [Fee Management Configuration](#fee-management-configuration)
+9. [Server Component Selection](#server-component-selection)
+10. [External Node (EN_) Configuration](#external-node-en_-configuration)
+11. [Conclusion](#conclusion)
 
 ## Configuration Architecture
 
@@ -67,14 +60,14 @@ Key parameters:
 The genesis configuration defines the initial state of the rollup:
 
 ```yaml
-genesis_root: 0x5d1b8d6f250d89b77b66a918e3e0f60f64ca959aee0c5f1031575491fd00bfa6
+genesis_root: '0xae467635b015107d0d5c054b72adf28dcdb8448bdaf7eba13e4173cfa656ba10'
 genesis_rollup_leaf_index: 54
-genesis_batch_commitment: 0xe81e1a4727269fe1ef3e2f8c3f5cfb9aab7c073722c278331b7e017033c13f8f
-genesis_protocol_semantic_version: '0.26.0'
+genesis_batch_commitment: '0x79cea1677fe1d82c0c0e6d41b6a89871b80e1ff79a884d4da373362ba8c2922e'
+genesis_protocol_semantic_version: '0.27.0'
 # deprecated
-genesis_protocol_version: 26
-default_aa_hash: 0x010005630848b5537f934eea6bd8c61c50648a162b90c82f316454f4109462b1
-bootloader_hash: 0x010008e79c154523aa30981e598b73c4a33c304bef9c82bae7d2ca4d21daedc7
+genesis_protocol_version: 27
+default_aa_hash: '0x0100056341ef0b54044394eb7f882870873d713d11b6431f0b50022a2c548e94'
+bootloader_hash: '0x010008e7ec4f3c5bff3f0c80c8cda2f08d7268b4f0652669e00713ef471ca186'
 l1_chain_id: 9
 l2_chain_id: 270
 fee_account: '0x0000000000000000000000000000000000000001'
@@ -176,12 +169,14 @@ Key parameters:
 - `required_signers`: Number of signers required for MuSig2 signatures
 - `verifiers_pub_keys`: Public keys of all Verifiers
 - `verifier_request_timeout`: Timeout for Verifier requests
+- `max_tx_weight`: Transaction weight limit used by the withdrawal TransactionBuilder for weight-based splitting; default is `MAX_STANDARD_TX_WEIGHT - 20000` via [`rust ViaVerifierConfig::max_tx_weight()`](https://github.com/vianetwork/via-core/blob/main/core/lib/config/src/configs/via_verifier.rs)
 
 Example configuration in `etc/env/configs/via_verifier.toml`:
 ```toml
 wallet_address = "bc1qverifieraddress..."
 verifier_mode = "VERIFIER"
 required_signers = 3
+max_tx_weight = 380000 # default if omitted: MAX_STANDARD_TX_WEIGHT - 20000
 ```
 
 ### Celestia Integration Configuration
@@ -450,239 +445,90 @@ export VIA_SERVER_COMPONENTS="sequencer,verifier"
 - **Distributed deployment**: Deploy components across multiple servers
 - **Development**: Focus on specific functionality during development
 
+## Bridge Configuration (new)
+
+Via now separates bridge-related parameters into a dedicated file and env namespace.
+
+Files and keys:
+- etc/env/base/via_bridge.toml
+  - coordinator_pub_key: hex-encoded coordinator public key
+  - verifiers_pub_keys: list of hex-encoded verifier public keys
+  - bridge_address: Bitcoin address of the bridge (P2WSH/P2TR as applicable)
+  - required_signers: threshold for MuSig2 sessions
+  - zk_agreement_threshold: fraction for L1 batch finalization by verifier votes (e.g., 0.66)
+
+Example:
+```toml
+coordinator_pub_key = "02abc..."
+verifiers_pub_keys = ["0211...", "03aa...", "0277..."]
+bridge_address = "bcrt1p..."
+required_signers = 2
+zk_agreement_threshold = 0.66
+```
+
+Environment variables (overrides):
+- VIA_BRIDGE_COORDINATOR_PUB_KEY
+- VIA_BRIDGE_VERIFIERS_PUB_KEYS (comma-separated)
+- VIA_BRIDGE_BRIDGE_ADDRESS
+- VIA_BRIDGE_REQUIRED_SIGNERS
+- VIA_BRIDGE_ZK_AGREEMENT_THRESHOLD
+
+Wiring changes:
+- The BTC watcher and API stack consume the bridge address from the bridge config at boot, but the active bridge address is sourced at runtime from the database (see API note).
+- Node storage initialization layers load and persist SystemWallets inferred from bootstrap inscriptions; consumers use the loaded wallets for indexing and validation.
+
+API change:
+- via_getBridgeAddress now returns the bridge address stored in the database (via_wallets), not a value injected from config.
+
+CLI change (deposit):
+- The deposit helpers/examples now require an explicit bridge address argument. Example:
+  ```bash
+  via token deposit \
+    --amount 10 \
+    --receiver-l2-address 0xYourL2 \
+    --bridge-address bcrt1p...
+  ```
+
+Release note (Celestia):
+- docker-compose Celestia image tag updated to v0.24.1-mocha.
+- Trusted header endpoint used by infra scripts updated to http://public-celestia-mocha4-consensus.numia.xyz/header.
+
+## External Node (EN_) Configuration
+
+The External Node (EN) is a read-only replica of the main node, serving JSON-RPC locally. It is configured via a baseline template and an operator-facing template emitted by the setup flow.
+
+Templates
+- Baseline template: [etc/env/configs/ext-node.toml](https://github.com/vianetwork/via-core/blob/main/etc/env/configs/ext-node.toml)
+- Operator-facing template (emitted by setup): [etc/env/configs/via_ext_node.toml](https://github.com/vianetwork/via-core/blob/main/etc/env/configs/via_ext_node.toml)
+- Setup utility: [infrastructure/via/src/setup_en.ts](https://github.com/vianetwork/via-core/blob/main/infrastructure/via/src/setup_en.ts)
+
+Core EN variables (compiled from templates or provided via environment)
+- `EN_MAIN_NODE_URL` — Upstream main node RPC (default http://127.0.0.1:3050 per template)
+- `EN_L2_CHAIN_ID` — L2 chain id (default 270); `EN_L1_CHAIN_ID` — L1 chain id (default 9)
+- `EN_HTTP_PORT`=3060, `EN_WS_PORT`=3061, `EN_HEALTHCHECK_PORT`=3081, `EN_PROMETHEUS_PORT`=3322
+- `EN_REQ_ENTITIES_LIMIT` — default 10000
+- `EN_STATE_CACHE_PATH`, `EN_MERKLE_TREE_PATH` — local RocksDB paths
+- `EN_SNAPSHOTS_RECOVERY_ENABLED` — default true; object store config via `EN_SNAPSHOTS_OBJECT_STORE_*`
+- `EN_PRUNING_ENABLED` — enable background pruning
+- `EN_PRUNING_DATA_RETENTION_SEC` — compiled from `pruning_data_retention_hours` in templates (default 1 hour)
+- `EN_EXTENDED_RPC_TRACING` — enable detailed spans for RPC tracing
+- `EN_MAIN_NODE_RATE_LIMIT_RPS` — rate limit upstream JSON-RPC pulls
+
+Consensus (optional)
+- Enable via CLI flag `--enable-consensus` (see [core/bin/via_external_node/src/main.rs](https://github.com/vianetwork/via-core/blob/main/core/bin/via_external_node/src/main.rs)).
+- When using file-based configs, supply `--config-path`, `--secrets-path`, `--external-node-config-path`, and `--consensus-path` if consensus is enabled.
+- Template keys for consensus files: `en.consensus.config_path` and `en.consensus.secrets_path` in [etc/env/configs/ext-node.toml](https://github.com/vianetwork/via-core/blob/main/etc/env/configs/ext-node.toml)
+
+API namespaces
+- Default namespaces are configurable via `api_namespaces` in [etc/env/configs/ext-node.toml](https://github.com/vianetwork/via-core/blob/main/etc/env/configs/ext-node.toml). Baseline: `["eth", "web3", "net", "pubsub", "zks", "en", "debug"]`.
+
+Observability
+- Log directives and backtraces are configured under `[rust]` in [etc/env/configs/ext-node.toml](https://github.com/vianetwork/via-core/blob/main/etc/env/configs/ext-node.toml).
+
+Relationship to other docs
+- See component overview in [external_node.md](external_node.md).
+- See RPC-specific surface in [rpc_api_layer.md](rpc_api_layer.md) for namespaces and rate/size limits.
+
 ## Conclusion
 
 The Via L2 Bitcoin ZK-Rollup system uses a comprehensive configuration system that allows for flexible deployment and operation. The wallet configuration system enables component-specific Bitcoin operations, while fee management ensures cost-effective transaction processing across different networks. Server component selection provides deployment flexibility for various operational requirements. By understanding the key configuration files, environment variables, and parameters, operators can effectively deploy and manage the system in various environments. The protocol version management system ensures smooth upgrades and backward compatibility.
-
-## L1 Indexer Configuration
-
-The L1 Indexer is a dedicated service that monitors Bitcoin L1 transactions and maintains synchronized state with the Via L2 system.
-
-### Database Configuration
-
-The L1 Indexer uses a dedicated database schema with the following tables:
-
-```sql
--- Deposit tracking
-CREATE TABLE deposits (
-    id SERIAL PRIMARY KEY,
-    txid VARCHAR(64) NOT NULL,
-    vout INTEGER NOT NULL,
-    amount BIGINT NOT NULL,
-    address VARCHAR(100) NOT NULL,
-    block_height INTEGER,
-    confirmed BOOLEAN DEFAULT FALSE,
-    processed BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Bridge withdrawal tracking
-CREATE TABLE bridge_withdrawals (
-    id SERIAL PRIMARY KEY,
-    txid VARCHAR(64) NOT NULL,
-    inscription_data TEXT,
-    block_height INTEGER,
-    confirmed BOOLEAN DEFAULT FALSE,
-    processed BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Withdrawal tracking
-CREATE TABLE withdrawals (
-    id SERIAL PRIMARY KEY,
-    txid VARCHAR(64) NOT NULL,
-    amount BIGINT NOT NULL,
-    address VARCHAR(100) NOT NULL,
-    block_height INTEGER,
-    confirmed BOOLEAN DEFAULT FALSE,
-    processed BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Indexer metadata
-CREATE TABLE indexer_metadata (
-    key VARCHAR(50) PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at TIMESTAMP DEFAULT NOW()
-);
-```
-
-### Configuration Parameters
-
-The L1 Indexer is configured through environment variables and configuration files:
-
-#### Database Configuration
-```toml
-# etc/env/base/via_l1_indexer.toml
-database_url = "postgresql://user:password@localhost/via_l1_indexer"
-database_pool_size = 10
-```
-
-#### Bitcoin Node Configuration
-```toml
-# Bitcoin RPC connection
-btc_rpc_url = "http://localhost:8332"
-btc_rpc_user = "bitcoin"
-btc_rpc_password = "password"
-btc_network = "regtest"  # mainnet, testnet, regtest
-```
-
-#### Indexing Configuration
-```toml
-# Block processing configuration
-start_block_height = 0
-confirmation_blocks = 6
-batch_size = 100
-polling_interval = 10  # seconds
-
-# Bridge configuration
-bridge_address = "bc1qbridgeaddress..."
-inscription_prefix = "via:"
-```
-
-### Environment Variables
-
-Key environment variables for L1 Indexer configuration:
-
-#### Database Variables
-- `VIA_L1_INDEXER_DATABASE_URL`: PostgreSQL connection URL for the indexer database
-- `VIA_L1_INDEXER_DATABASE_POOL_SIZE`: Database connection pool size (default: 10)
-
-#### Bitcoin Node Variables
-- `VIA_L1_INDEXER_BTC_RPC_URL`: Bitcoin RPC URL
-- `VIA_L1_INDEXER_BTC_RPC_USER`: Bitcoin RPC username
-- `VIA_L1_INDEXER_BTC_RPC_PASSWORD`: Bitcoin RPC password
-- `VIA_L1_INDEXER_BTC_NETWORK`: Bitcoin network (mainnet/testnet/regtest)
-
-#### Processing Variables
-- `VIA_L1_INDEXER_START_BLOCK`: Starting block height for indexing
-- `VIA_L1_INDEXER_CONFIRMATION_BLOCKS`: Number of confirmation blocks required
-- `VIA_L1_INDEXER_BATCH_SIZE`: Number of blocks to process in each batch
-- `VIA_L1_INDEXER_POLLING_INTERVAL`: Polling interval in seconds
-
-#### Bridge Variables
-- `VIA_L1_INDEXER_BRIDGE_ADDRESS`: Bitcoin bridge address to monitor
-- `VIA_L1_INDEXER_INSCRIPTION_PREFIX`: Prefix for inscription data filtering
-
-### Service Configuration
-
-The L1 Indexer can be run as a standalone service or integrated with the main Via server:
-
-#### Standalone Service
-```bash
-# Run L1 Indexer as standalone service
-via-indexer --config /path/to/l1_indexer.toml
-
-# Run with specific components
-via-indexer --components deposit_monitor,withdrawal_processor
-```
-
-#### Integrated Service
-```bash
-# Run as part of main Via server
-via_server --components sequencer,verifier,l1_indexer
-```
-
-### Docker Configuration
-
-The L1 Indexer can be deployed using Docker:
-
-```yaml
-# docker-compose-l1-indexer.yml
-version: '3.8'
-services:
-  l1-indexer:
-    image: via/l1-indexer:latest
-    environment:
-      - VIA_L1_INDEXER_DATABASE_URL=postgresql://postgres:password@postgres:5432/via_l1_indexer
-      - VIA_L1_INDEXER_BTC_RPC_URL=http://bitcoind:8332
-      - VIA_L1_INDEXER_BTC_RPC_USER=bitcoin
-      - VIA_L1_INDEXER_BTC_RPC_PASSWORD=password
-      - VIA_L1_INDEXER_BTC_NETWORK=regtest
-    depends_on:
-      - postgres
-      - bitcoind
-    restart: unless-stopped
-
-  postgres:
-    image: postgres:15
-    environment:
-      - POSTGRES_DB=via_l1_indexer
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=password
-    volumes:
-      - l1_indexer_db:/var/lib/postgresql/data
-
-volumes:
-  l1_indexer_db:
-```
-
-### Monitoring and Health Checks
-
-The L1 Indexer provides health check endpoints and metrics:
-
-#### Health Check Endpoint
-```bash
-curl http://localhost:8080/health
-```
-
-#### Metrics Endpoint
-```bash
-curl http://localhost:8080/metrics
-```
-
-#### Key Metrics
-- `via_l1_indexer_blocks_processed_total`: Total blocks processed
-- `via_l1_indexer_deposits_found_total`: Total deposits found
-- `via_l1_indexer_withdrawals_processed_total`: Total withdrawals processed
-- `via_l1_indexer_last_processed_block`: Last processed block height
-- `via_l1_indexer_processing_lag_blocks`: Number of blocks behind tip
-
-### CLI Management
-
-The L1 Indexer provides CLI commands for management:
-
-```bash
-# Start the indexer
-via-indexer start
-
-# Stop the indexer
-via-indexer stop
-
-# Restart the indexer
-via-restart-indexer
-
-# Check indexer status
-via-indexer status
-
-# Reset indexer state (caution: destructive)
-via-indexer reset --confirm
-```
-
-### Troubleshooting
-
-Common configuration issues and solutions:
-
-#### Database Connection Issues
-```bash
-# Test database connection
-psql $VIA_L1_INDEXER_DATABASE_URL -c "SELECT 1;"
-
-# Check database schema
-via-indexer check-schema
-```
-
-#### Bitcoin Node Connection Issues
-```bash
-# Test Bitcoin RPC connection
-bitcoin-cli -rpcconnect=localhost -rpcport=8332 -rpcuser=bitcoin -rpcpassword=password getblockchaininfo
-
-# Check indexer Bitcoin connection
-via-indexer test-btc-connection
-```
-
-#### Performance Tuning
-- Increase `batch_size` for faster initial sync
-- Adjust `polling_interval` based on network requirements
-- Tune `database_pool_size` based on concurrent load
-- Use appropriate `confirmation_blocks` for security vs. speed trade-off

@@ -84,6 +84,43 @@ pub async fn create_unsigned_tx(
         .await
 }
 ```
+> Update Transaction weight-based splitting and API changes
+>
+> - Large withdrawals are now split across multiple bridge transactions when the estimated transaction weight approaches the standard policy limit.
+> - Constants and weight math live in [via_verifier/lib/via_musig2/src/constants.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/constants.rs#L1) and include INPUT_BASE_SIZE, INPUT_WITNESS_SIZE, OUTPUT_SIZE, OP_RETURN_SIZE, TX_OVERHEAD, WITNESS_OVERHEAD, FIXED_OVERHEAD_WEIGHT, and AVAILABLE_WEIGHT (based on bitcoin::policy::MAX_STANDARD_TX_WEIGHT).
+> - Fee calculation was updated to be witness-aware and align with the new sizing model: see [via_verifier/lib/via_musig2/src/fee.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/fee.rs).
+> - TransactionBuilder APIs:
+>   - [rust TransactionBuilder::estimate_transaction_weight()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/transaction_builder.rs) estimates total weight from input/output counts.
+>   - [rust TransactionBuilder::get_transaction_metadata()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/transaction_builder.rs) partitions inputs/outputs into chunks that fit within a configurable weight limit.
+>   - [rust TransactionBuilder::build_bridge_txs()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/transaction_builder.rs) materializes signed-ready transaction skeletons from the metadata chunks.
+>   - [rust TransactionBuilder::build_transaction_with_op_return()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/transaction_builder.rs) now returns Vec&lt;UnsignedBridgeTx&gt; and accepts a weight_limit parameter (e.g., MAX_STANDARD_TX_WEIGHT) and op_return_data as Vec&lt;&amp;Vec&lt;u8&gt;&gt;.
+>
+> Updated signature (simplified):
+>
+> ```rust
+> // via_verifier/lib/via_musig2/src/transaction_builder.rs
+> pub async fn build_transaction_with_op_return(
+>     &self,
+>     outputs: Vec<TxOut>,
+>     op_return_prefix: &[u8],
+>     op_return_data: Vec<&Vec<u8>>,
+>     fee_strategy: Arc<dyn FeeStrategy>,
+>     change_output: Option<TxOut>,
+>     max_outputs_per_tx: Option<usize>,
+>     weight_limit: u64, // e.g. bitcoin::policy::MAX_STANDARD_TX_WEIGHT
+> ) -> anyhow::Result<Vec<UnsignedBridgeTx>> { /* ... */ }
+> ```
+>
+> Example usage (examples updated to pick the first tx when only a single transaction is needed):
+>
+> - [via_verifier/lib/via_musig2/examples/coordinator.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/examples/coordinator.rs#L447)
+> - [via_verifier/lib/via_musig2/examples/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/examples/withdrawal.rs#L129)
+>
+> Test coverage for chunking and weight enforcement:
+>
+> - [via_verifier/lib/via_musig2/src/test/bridge_tx.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/test/bridge_tx.rs#L334)
+> - [via_verifier/lib/via_musig2/src/test/chunk_outputs.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/test/chunk_outputs.rs#L1)
+> - [via_verifier/lib/via_musig2/src/test/mod.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/test/mod.rs#L1)
 
 ### 3.2 Security Benefits
 
@@ -239,6 +276,11 @@ pub fn create_final_signature(&mut self) -> Result<CompactSignature, MusigError>
 ```
 
 ### 4.4 Transaction Building and Signing
+
+Withdrawal fee accounting:
+- The fee strategy evenly distributes the total fee across withdrawal outputs and rounds up to the next multiple of the output count to guarantee the transaction is not underfunded with respect to its virtual size (let `r = base_fee % output_count`; if `r == 0` then `total_fee = base_fee`; else `total_fee = base_fee + (output_count - r)`); see [rust FeeStrategy::estimate_fee_sats()](via_verifier/lib/via_musig2/src/fee.rs:22).
+- Per-user fee equals `total_fee / outputs_count`. If there are no withdrawal outputs (e.g., all requests are too small after fee filtering), [rust UnsignedBridgeTx::get_fee_per_user()](via_verifier/lib/via_verifier_types/src/transaction.rs:96) returns the total fee to avoid division by zero and keep accounting consistent.
+- If the constructed unsigned transaction ends up with no withdrawal outputs, the builder treats it as a no-op and does not insert it into the UTXO manager; see [rust TransactionBuilder::build_transaction_with_op_return()](via_verifier/lib/via_musig2/src/transaction_builder.rs:58).
 
 The `transaction_builder.rs` module handles the construction of Bitcoin transactions that will be signed using MuSig2:
 

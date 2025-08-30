@@ -69,6 +69,13 @@ The Mempool uses several key data structures to efficiently manage transactions:
        capacity: u64,
    }
    ```
+### Implementation updates (commits 0037–0044)
+
+- New crate: [`core/lib/via_mempool`](core/lib/via_mempool/Cargo.toml) provides the mempool implementation used by State Keeper.
+- Data structure adjustments in [`rust MempoolStore`](core/lib/via_mempool/src/mempool_store.rs:83):
+  - L1 transactions now stored in `BTreeMap<PriorityOpId, L1Tx>` for ordered retrieval.
+  - Field renamed to track last processed priority op: `last_priority_id` replaces `next_priority_id`.
+- Public re-exports in [`rust lib.rs`](core/lib/via_mempool/src/lib.rs:51) expose `MempoolStore`, `MempoolStats`, `MempoolInfo`, and `L2TxFilter` to integrators (e.g., State Keeper).
 
 2. **AccountTransactions**: Manages transactions for a specific account:
    ```rust

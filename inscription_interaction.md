@@ -80,7 +80,7 @@ The commit transaction creates a P2TR (Pay-to-Taproot) output that commits to th
 
 ## Inscription Types
 
-Via L2 supports six types of inscriptions, each serving a specific purpose in the system:
+Via L2 supports eight types of inscriptions, each serving a specific purpose in the system:
 
 1. **L1BatchDAReference**: Commits L1 batch data availability information
    ```rust
@@ -137,19 +137,48 @@ Via L2 supports six types of inscriptions, each serving a specific purpose in th
    }
    ```
 
-7. **SystemContractUpgrade**: Contains system contract upgrade information
-   ```rust
-   pub struct SystemContractUpgradeInput {
-       /// New protocol version ID.
-       pub version: ProtocolSemanticVersion,
-       /// New bootloader code hash.
-       pub bootloader_code_hash: H256,
-       /// New default account code hash.
-       pub default_account_code_hash: H256,
-       /// The system contracts to upgrade (address and new hash pairs).
-       pub system_contracts: Vec<(EVMAddress, H256)>,
-   }
-   ```
+7. **SystemContractUpgradeProposal**: Witness-based proposal inscription
+```rust
+pub struct SystemContractUpgradeProposalInput {
+    /// New protocol version
+    pub version: ProtocolSemanticVersion,
+    /// New bootloader code hash
+    pub bootloader_code_hash: H256,
+    /// New default account code hash
+    pub default_account_code_hash: H256,
+    /// System contracts to upgrade (address, new hash)
+    pub system_contracts: Vec<(EVMAddress, H256)>,
+}
+```
+
+8. **SystemContractUpgrade**: Governance execution (OP_RETURN)
+```rust
+pub struct SystemContractUpgradeInput {
+    /// The input UTXOs that authorize the governance execution
+    pub inputs: Vec<OutPoint>,
+    /// The txid of the previously inscribed upgrade proposal
+    pub proposal_tx_id: Txid,
+}
+```
+
+9. System wallet updates
+   - UpdateSequencer (witness-based proposal) defines a new sequencer P2WPKH address. Governance then executes an OP_RETURN message to apply it.
+   - UpdateGovernance (OP_RETURN execution) carries the new governance address.
+   - UpdateBridge uses a two-phase flow similar to upgrades:
+     - UpdateBridgeProposal (witness) proposes a new bridge MuSig2 address and a verifier set.
+     - UpdateBridge (OP_RETURN) references the proposal by txid and authorizes it via governance inputs.
+
+OP_RETURN execution prefixes (ASCII):
+- "VIA_PROTOCOL:SEQ" for sequencer updates
+- "VIA_PROTOCOL:GOV" for governance updates
+- "VIA_PROTOCOL:BRI" for bridge updates
+- "VIA_PROTOCOL:UPGRADE" for protocol upgrades (existing)
+
+Layouts:
+- UpdateSequencer: OP_RETURN <prefix> <new_sequencer_address_utf8>
+- UpdateGovernance: OP_RETURN <prefix> <new_governance_address_utf8>
+- UpdateBridge: OP_RETURN <prefix> <32‑byte proposal_tx_id> (little‑endian as used by Bitcoinjs embed in tooling)
+- Upgrade execution: OP_RETURN <prefix> <32‑byte proposal_tx_id>
 
 Each inscription type has a corresponding message identifier defined as a static `PushBytesBuf` value:
 
@@ -168,6 +197,41 @@ pub static ref L1_TO_L2_MSG: PushBytesBuf = PushBytesBuf::from(b"L1ToL2Message")
 pub static ref SYSTEM_CONTRACT_UPGRADE_MSG: PushBytesBuf =
     PushBytesBuf::from(b"SystemContractUpgrade");
 ```
+### BridgeWithdrawal inscription (OP_RETURN)
+
+BridgeWithdrawal messages are also supported via OP_RETURN. The layout includes an optional withdrawal index for ordering/diagnostics.
+
+Layout (little endian where noted):
+1) Prefix bytes: VIA_PROTOCOL:WITHDRAWAL: (implementation constant: OP_RETURN_WITHDRAW_PREFIX)
+2) 1-byte tag/reserved (implementation detail; currently ignored)
+3) 32 bytes l1_batch_proof_reveal_tx_id
+4) Optional 8 bytes index_withdrawal (i64 LE). When absent, treat as 0.
+
+Parser
+- The parser tolerates shorter OP_RETURN payloads and conditionally reads the 8-byte index when present:
+  - [rust MessageParser::parse_bridge_withdrawal() bounds and optional index read](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs#L793)
+  - [rust MessageParser index_withdrawal LE parse](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs#L800)
+
+Carrier type
+- The parsed index is carried on the message struct:
+  - [rust BridgeWithdrawalInput.index_withdrawal](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/types.rs#L57)
+
+### Upgrade Protocol inscription (OP_RETURN)
+
+- The execution transaction for governance upgrades is an OP_RETURN with a fixed ASCII prefix and a 32-byte proposal txid.
+
+Layout:
+1) Prefix bytes: "VIA_PROTOCOL:UPGRADE" (implementation constant OP_RETURN_UPGRADE_PREFIX)
+2) 1-byte separator/reserved
+3) 32 bytes proposal_tx_id
+
+Parser:
+- [`rust MessageParser::parse_protocol_upgrade_transaction()`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs) dispatches to:
+  - [`rust MessageParser::parse_op_return_protocol_upgrade()`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs) which extracts the proposal txid and assembles a SystemContractUpgrade message with input OutPoints from the execution tx.
+
+Indexer extraction:
+- [`rust BitcoinInscriptionIndexer::extract_important_transactions()`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/mod.rs) now returns (gov_txs, system_txs, bridge_txs), where gov_txs are outputs to the configured governance address.
+- Validity check: [`rust BitcoinInscriptionIndexer::is_valid_gov_message()`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/mod.rs) ensures the referenced input belongs to the governance address.
 
 ## Inscription Creation Process
 
@@ -236,15 +300,31 @@ pub async fn process_block(
     block_height: u32,
 ) -> BitcoinIndexerResult<Vec<FullInscriptionMessage>> {
     // ...
-    let (system_tx, bridge_tx) = self.extract_important_transactions(&block.txdata);
-    
-    if let Some(system_tx) = system_tx {
-        let parsed_messages: Vec<_> = system_tx
+    let (gov_txs, system_txs, bridge_txs) = self.extract_important_transactions(&block.txdata);
+
+    // Parse governance OP_RETURN upgrade executions
+    if let Some(gov_txs) = gov_txs {
+        let parsed: Vec<_> = gov_txs
             .iter()
-            .flat_map(|tx| self.parser.parse_system_transaction(tx, block_height))
+            .flat_map(|tx| self.parser.parse_protocol_upgrade_transaction(tx, block_height))
             .collect();
 
-        let messages: Vec<_> = parsed_messages
+        let messages: Vec<_> = parsed
+            .into_iter()
+            .filter(|message| self.is_valid_gov_message(message))
+            .collect();
+
+        valid_messages.extend(messages);
+    }
+
+    // Parse system (witness-based) inscriptions
+    if let Some(system_txs) = system_txs {
+        let parsed: Vec<_> = system_txs
+            .iter()
+            .flat_map(|tx| self.parser.parse_system_transaction(tx, block_height, None))
+            .collect();
+
+        let messages: Vec<_> = parsed
             .into_iter()
             .filter(|message| self.is_valid_system_message(message))
             .collect();

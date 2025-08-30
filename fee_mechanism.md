@@ -243,6 +243,92 @@ The fee mechanism can be configured through several parameters:
 
 7. **Max Pubdata Per Batch**: Maximum pubdata bytes per batch
 
+## 6. Withdrawal Fee Strategy for Bitcoin Withdrawals
+
+This release introduces a fee strategy dedicated to Bitcoin withdrawal transactions. The strategy ensures:
+- Total transaction fee is estimated accurately and made evenly divisible across user outputs
+- Fees are distributed equally among all withdrawal outputs
+- Withdrawals that cannot cover their fair share of the fee are filtered out before signing
+- Transactions are built with a fee rate that matches current network conditions within a strict tolerance
+
+### 6.1 Strategy Pattern and Implementation
+
+The fee logic is implemented using a Strategy pattern:
+
+- Trait definition with default size-based fee estimation and an interface for applying fees:
+  - [via_verifier/lib/via_musig2/src/fee.rs](via_verifier/lib/via_musig2/src/fee.rs:9)
+
+- Withdrawal-specific strategy type and implementation:
+  - [WithdrawalFeeStrategy](via_verifier/lib/via_musig2/src/fee.rs:44)
+  - [impl FeeStrategy for WithdrawalFeeStrategy](via_verifier/lib/via_musig2/src/fee.rs:52)
+
+- Transaction builder integrates the strategy when constructing withdrawal transactions with OP_RETURN:
+  - [TransactionBuilder::build_transaction_with_op_return()](via_verifier/lib/via_musig2/src/transaction_builder.rs:61)
+
+- Fee per user helper and empty-transaction guard:
+  - [UnsignedBridgeTx::get_fee_per_user()](via_verifier/lib/via_verifier_types/src/transaction.rs:17)
+  - [UnsignedBridgeTx::is_empty()](via_verifier/lib/via_verifier_types/src/transaction.rs:25)
+
+- Constant OP_RETURN prefix used for withdrawal references:
+  - [OP_RETURN_WITHDRAW_PREFIX](via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs:21)
+
+### 6.2 Fee Estimation and Equal Distribution
+
+- The strategy estimates the total fee as a function of inputs, outputs and fee rate (sat/vB) with a correction to ensure the fee is evenly divisible by the number of withdrawal outputs:
+  - Remainder-safe calculation: Round up to the next multiple of the output count:
+    - Let `r = base_fee % output_count`. If `r == 0` then `total_fee = base_fee`; else `total_fee = base_fee + (output_count - r)`. See [rust FeeStrategy::estimate_fee_sats()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/fee.rs#L22).
+  - Tests: divisibility and edge cases are covered by [rust test_estimate_fee_multiple_cases](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/fee.rs#L40).
+
+- After total fee is determined, it is split equally across all user withdrawal outputs:
+  - [impl FeeStrategy for WithdrawalFeeStrategy](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/fee.rs#L52)
+  - Fixed fee per user calculation: [rust UnsignedBridgeTx::get_fee_per_user()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_verifier_types/src/transaction.rs#L96)
+  - Handles edge case where there are no withdrawal outputs (only change and OP_RETURN)
+  - Empty/no-op transactions are not inserted into the UTXO manager: [rust TransactionBuilder::build_transaction_with_op_return()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/transaction_builder.rs#L82)
+
+### 6.3 Iterative Filtering of Uneconomical Withdrawals
+
+- Algorithm outline (pseudocode):
+  1. Estimate total fee for the current output set
+  2. Compute fee_per_user = total_fee / outputs_count
+  3. Filter out any outputs where output.value < fee_per_user
+  4. If outputs were removed, repeat from step 1 with the smaller set
+  5. When all remaining outputs can pay their fee share, subtract fee_per_user from each output value and finalize
+
+- Code path:
+  - [impl FeeStrategy for WithdrawalFeeStrategy](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/fee.rs#L52)
+
+- Validations covered by tests:
+  - Equal split across outputs: [test_fee_applied_equally_to_outputs()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/fee.rs#L107)
+  - Removal of too-small outputs: [test_small_output_is_removed()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/fee.rs#L135)
+  - No viable outputs edge case: [test_no_outputs_can_pay_fee()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/fee.rs#L163)
+
+### 6.4 Network Fee Rate Validation
+
+Withdrawal sessions validate the fee rate used to construct the unsigned transaction against the current network fee rate:
+- The used fee rate must be within ±1 sat/vB of the network's current estimate
+- If the difference exceeds the tolerance, the session is rejected and not signed
+- Withdrawal validation ensures each user receives the correct amount after fee deduction
+
+Reference:
+- Fee rate check: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs#L369)
+- User amount validation with clear variable naming: `user_should_receive = amount - fee_per_user`
+
+### 6.5 Behavior with Insufficient Withdrawals
+
+- Withdrawals with amount < fee_per_user are filtered out prior to signing
+- If all withdrawals are filtered out, the resulting transaction will be empty (only OP_RETURN and change outputs). Such transactions are not broadcast, and the session is treated as a no-op:
+  - [UnsignedBridgeTx::is_empty()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_verifier_types/src/transaction.rs#L25)
+- Empty transactions are not inserted into the UTXO manager to prevent tracking of non-existent UTXOs
+  - Transaction builder checks if the bridge transaction is empty before UTXO insertion: [TransactionBuilder::build_transaction_with_op_return()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/transaction_builder.rs#L82)
+
+### 6.6 Integration into the Bridge Flow
+
+- Coordinator builds withdrawal transactions with the fee strategy and OP_RETURN metadata for the proof reference:
+  - [TransactionBuilder::build_transaction_with_op_return()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/transaction_builder.rs#L61)
+
+- For indexing, validation of origin and storage of bridge withdrawal metadata see:
+  - Bridge docs: [bridge.md](bridge.md)
+
 ## 7. Advanced Fee Management Features
 
 ### 7.1 Fee Rate Limits per Network

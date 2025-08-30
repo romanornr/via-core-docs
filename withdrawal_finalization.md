@@ -16,38 +16,38 @@ The withdrawal finalization logic involves several key components:
 
 ### 2.1 Core Components
 
-1. **WithdrawalClient** (`via_verifier/lib/via_withdrawal_client/src/client.rs`)
+1. WithdrawalClient (`via_verifier/lib/via_withdrawal_client/src/client.rs`)
    - Retrieves withdrawal requests from the data availability layer
    - Parses and validates withdrawal messages
 
-2. **WithdrawalSession** (`via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs`)
+2. WithdrawalSession (`via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs`)
    - Identifies finalized L1 batches with pending withdrawals
    - Creates and verifies unsigned withdrawal transactions
    - Manages the withdrawal session lifecycle
 
-3. **TransactionBuilder** (`via_verifier/lib/via_musig2/src/transaction_builder.rs`)
+3. TransactionBuilder (`via_verifier/lib/via_musig2/src/transaction_builder.rs`)
    - Constructs Bitcoin transactions for withdrawals
    - Manages UTXOs for the bridge address
    - Creates OP_RETURN outputs with proof references
 
-4. **ViaWithdrawalVerifier** (`via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs`)
+4. ViaWithdrawalVerifier (`via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs`)
    - Coordinates the MuSig2 signing process among verifiers
    - Signs and broadcasts the final withdrawal transaction
 
-5. **RestApi** (`via_verifier/node/via_verifier_coordinator/src/coordinator/api_decl.rs` and `api_impl.rs`)
+5. RestApi (`via_verifier/node/via_verifier_coordinator/src/coordinator/api_decl.rs` and `api_impl.rs`)
    - Provides API endpoints for verifiers to participate in signing sessions
    - Manages nonce and signature collection
 
 ### 2.2 Supporting Components
 
-1. **MuSig2 Implementation** (`via_verifier/lib/via_musig2/src/lib.rs`)
+1. MuSig2 Implementation (`via_verifier/lib/via_musig2/src/lib.rs`)
    - Implements the MuSig2 multi-signature protocol
    - Integrates with Bitcoin's Taproot functionality
 
-2. **Data Availability Client** (`via_da_client`)
+2. Data Availability Client (`via_da_client`)
    - Interfaces with Celestia to retrieve batch and withdrawal data
 
-3. **Bitcoin Client** (`via_btc_client`)
+3. Bitcoin Client (`via_btc_client`)
    - Interfaces with the Bitcoin network to broadcast transactions and manage UTXOs
 
 ## 3. Withdrawal Finalization Process
@@ -60,23 +60,27 @@ The withdrawal finalization process consists of several sequential steps:
 
 ```rust
 // via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs
-async fn session(&self) -> anyhow::Result<Option<SessionOperation>> {
-    // Get the l1 batches finalized but withdrawals not yet processed
-    let l1_batches = self
-        .master_connection_pool
-        .connection_tagged("withdrawal session")
-        .await?
-        .via_votes_dal()
-        .list_finalized_blocks_and_non_processed_withdrawals()
-        .await?;
-    
-    if l1_batches.is_empty() {
-        return Ok(None);
+#[axum::async_trait]
+impl ISession for WithdrawalSession {
+    async fn session(&self) -> anyhow::Result<Option<SessionOperation>> {
+        // Load the next work unit, if any
+        let (l1_batch_number, raw_proof_tx_id, withdrawals_to_process) =
+            self.prepare_withdrawal_session().await?;
+
+        if withdrawals_to_process.is_empty() {
+            return Ok(None);
+        }
+
+        // ... construct and verify unsigned tx, proceed with the session ...
     }
-    
-    // Process withdrawals...
 }
 ```
+
+Helper
+- The helper prepares the next work unit:
+  - Returns (l1_batch_number: i64, raw_proof_tx_id: Vec<u8>, withdrawals: Vec<WithdrawalRequest>)
+  - If a finalized batch contains no withdrawals, it marks the vote transaction as processed and continues scanning.
+- See file: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs)
 
 2. The `WithdrawalClient` retrieves withdrawal requests from the data availability layer:
 
@@ -242,6 +246,14 @@ async fn _verify_withdrawals(
 }
 ```
 
+### 3.2.1 Fee distribution and rounding in withdrawals (MuSig2)
+
+- Total fee estimation is based on the transaction virtual size. To avoid underpayment due to integer division when splitting fees across multiple withdrawal outputs, the fee strategy rounds up to the next multiple of the output count: let `r = base_fee % output_count`; if `r == 0` then `total_fee = base_fee`; else `total_fee = base_fee + (output_count - r)`; see [rust FeeStrategy::estimate_fee_sats()](via_verifier/lib/via_musig2/src/fee.rs:22).
+- Per-user fee is computed from the total fee divided by the number of withdrawal outputs. If there are no withdrawal outputs (e.g., all withdrawals are too small after fee filtering), [rust UnsignedBridgeTx::get_fee_per_user()](via_verifier/lib/via_verifier_types/src/transaction.rs:96) returns the total fee to prevent division-by-zero and keep accounting consistent.
+- Builder no-op guard: If the constructed unsigned withdrawal transaction is effectively empty (no withdrawal outputs remain), it is not inserted into the UTXO manager; see [rust TransactionBuilder::build_transaction_with_op_return()](via_verifier/lib/via_musig2/src/transaction_builder.rs:58). This prevents stale UTXO tracking for non-broadcast transactions.
+- Coordinator validation uses explicit semantics for user amounts after fees: `user_should_receive = amount - fee_per_user`, and checks that each output value matches this expectation; see [rust WithdrawalSession](via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs:113).
+
+- Output count consistency check: The coordinator validates that the number of adjusted withdrawals equals the number of withdrawal outputs in the unsigned transaction, accounting for OP_RETURN and change outputs (i.e., `adjusted_withdrawals.len() + 2 == unsigned_tx.tx.output.len()`); see [rust WithdrawalSession](via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs:43).
 ### 3.3 MuSig2 Signing Process
 
 1. The Coordinator initiates a signing session:
@@ -422,19 +434,26 @@ async fn after_broadcast_final_transaction(
     txid: Txid,
     session_op: &SessionOperation,
 ) -> anyhow::Result<bool> {
+    let votable_tx_id = self
+        .get_votable_tx_id(&session_op.get_proof_tx_id())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Votable transaction does not exist"))?;
+
+    let hash_bytes = txid.to_byte_array().to_vec();
+
     self.master_connection_pool
         .connection_tagged("verifier task")
         .await?
-        .via_votes_dal()
-        .mark_vote_transaction_as_processed(
-            H256::from_slice(&txid.as_raw_hash().to_byte_array()),
-            &session_op.get_proof_tx_id(),
-            session_op.get_l1_batche_number(),
-        )
+        .via_bridge_dal()
+        .update_bridge_tx(votable_tx_id, session_op.index() as i64, &hash_bytes)
         .await?;
 
+    self.transaction_builder
+        .utxo_manager_insert_transaction(session_op.get_unsigned_bridge_tx().tx.clone())
+        .await;
+
     tracing::info!(
-        "New withdrawal transaction processed, l1 batch {} musig2 tx_id {}",
+        "Final withdrawal transaction broadcasted: L1 batch {}, txid {}",
         session_op.get_l1_batche_number(),
         txid
     );
@@ -442,6 +461,32 @@ async fn after_broadcast_final_transaction(
     Ok(true)
 }
 ```
+
+Note: The DAL sets updated_at alongside bridge_tx_id and provides helpers to fetch by proof_reveal_tx_id and to update by l1_batch_number; see [via_verifier/lib/verifier_dal/src/via_votes_dal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/src/via_votes_dal.rs).
+
+### 3.4 Multi-transaction withdrawals (weight-based splitting)
+
+- When the estimated transaction weight would exceed Bitcoin standard policy limits, the TransactionBuilder splits outputs across multiple bridge transactions, each constrained by `bitcoin::policy::MAX_STANDARD_TX_WEIGHT`.
+- `build_transaction_with_op_return` now returns a vector of unsigned transactions (`Vec<UnsignedBridgeTx>`). The Coordinator persists all unsigned candidates in the `via_bridge_tx` table; the row with an empty `hash` indicates the candidate to be signed. After broadcast, the `hash` is updated with the final txid for reconciliation.
+- Weight limit is configurable via [`rust ViaVerifierConfig::max_tx_weight()`](core/lib/config/src/configs/via_verifier.rs); default is `MAX_STANDARD_TX_WEIGHT - 20000`.
+- References:
+  - Weight constants and estimation: [via_verifier/lib/via_musig2/src/constants.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/constants.rs#L1), [via_verifier/lib/via_musig2/src/transaction_builder.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/transaction_builder.rs)
+  - Candidate persistence and lookup: [via_verifier/lib/verifier_dal/src/via_bridge.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/src/via_bridge.rs)
+  - Examples selecting the first tx when only one is needed: [via_verifier/lib/via_musig2/examples/coordinator.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/examples/coordinator.rs#L447), [via_verifier/lib/via_musig2/examples/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/examples/withdrawal.rs#L129)
+
+### 3.5 Withdrawal inscription intake (BTC Watch)
+
+- Component: BTC Watch `WithdrawalProcessor`
+- Input: BridgeWithdrawal inscription (contains `l1_batch_proof_reveal_tx_id` and on-chain `tx_id`)
+- Behavior:
+  - Reverse bytes of `proof_reveal_tx_id` (endian handling) to form the H256 key
+  - Lookup `(votable_tx_id, l1_batch_number, bridge_tx_id)` by `(proof_reveal_tx_id, index_withdrawal)`; if none, warn and continue
+  - If `bridge_tx_id` already equals the indexed `tx_id`: treat as processed; return (idempotent)
+  - Else, update `bridge_tx_id` for `l1_batch_number` and set `METRICS.inscriptions_processed[Withdrawal]`
+  - Multiple transactions per batch are supported via `index_withdrawal`; updates are keyed by `(votable_tx_id, index_withdrawal)`. If an unexpected duplicate mapping is detected for the same batch and index, a `SyncError` is returned to surface operator attention
+- Code reference: [via_verifier/node/via_btc_watch/src/message_processors/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_btc_watch/src/message_processors/withdrawal.rs)
+- Effect: Enables idempotent post-broadcast reconciliation when BTC Watch sees the withdrawal inscription, independent of who broadcast the transaction
+- When present, index_withdrawal (i64 LE) is parsed from OP_RETURN and attached to BridgeWithdrawalInput; default 0 when absent. See [MessageParser](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs#L800) and [BridgeWithdrawalInput.index_withdrawal](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/types.rs#L57).
 
 ## 4. Bitcoin Transaction Structure
 
@@ -454,9 +499,9 @@ The final Bitcoin withdrawal transaction has the following structure:
 
 ### 4.2 Outputs
 
-1. **Withdrawal Outputs**: One output for each unique recipient address, with the total amount for that address
-2. **OP_RETURN Output**: Contains the prefix "VIA_PROTOCOL:WITHDRAWAL:" followed by the proof transaction ID
-3. **Change Output** (optional): Returns any excess funds back to the bridge address
+1. Withdrawal Outputs: One output for each unique recipient address, with the total amount for that address
+2. OP_RETURN Output: Contains the prefix "VIA_PROTOCOL:WITHDRAWAL:" followed by the proof transaction ID
+3. Change Output (optional): Returns any excess funds back to the bridge address
 
 ### 4.3 Witness Structure
 
@@ -544,6 +589,32 @@ The withdrawal finalization process is coordinated by the Verifier Network:
 - The withdrawal transaction is verified to ensure it correctly includes all withdrawals
 - The OP_RETURN output is verified to contain the correct proof transaction ID
 - The transaction is signed using the MuSig2 protocol with the SIGHASH_ALL flag
+
+### 7.4 Fee-Aware Validation Enhancements
+
+Recent commits add fee-aware validation to the withdrawal finalization pipeline:
+
+- Network fee rate tolerance
+  - The fee rate used to build the unsigned withdrawal transaction must be within ±1 sat/vB of the current network estimate
+  - Reference: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs#L369)
+
+- Equal fee distribution across outputs
+  - Fees are calculated once and distributed equally across all withdrawal outputs using a strategy pattern
+  - References:
+    - Fee strategy trait and implementation: [via_verifier/lib/via_musig2/src/fee.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/fee.rs#L9), [via_verifier/lib/via_musig2/src/fee.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/fee.rs#L44), [via_verifier/lib/via_musig2/src/fee.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/fee.rs#L52)
+    - Per-user fee helper: [via_verifier/lib/via_verifier_types/src/transaction.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_verifier_types/src/transaction.rs#L17)
+
+- Output value checks with fee deduction
+  - During verification, each withdrawal output is validated to match the expected user amount minus the per-user fee
+  - Reference: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs#L427)
+
+- Filtering of uneconomical withdrawals
+  - Withdrawals that cannot cover their share of the fee are excluded from the unsigned transaction prior to signing
+  - Reference: [via_verifier/lib/via_musig2/src/fee.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/fee.rs#L52)
+
+See also:
+- Bridge-level validation and indexing details: [bridge.md](bridge.md)
+- Fee strategy design and behavior: [fee_mechanism.md](fee_mechanism.md)
 
 ## 8. Current Limitations and Future Improvements
 

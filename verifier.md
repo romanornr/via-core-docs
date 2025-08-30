@@ -102,6 +102,53 @@ sequenceDiagram
 3. The Coordinator orchestrates the MuSig2 signing process
 4. After successful generation of the aggregated signature, the Coordinator broadcasts the withdrawal transaction to the Bitcoin network
 
+#### Sequential gating and idempotency
+
+- Before signing a withdrawal session, the verifier enforces sequential gating by comparing the expected L1 batch number from the active session with the current session’s batch number; it returns early if they don’t match.
+- Idempotency check: if the bridge session is already processed (bridge_tx_id present), the verifier skips signing for that batch.
+- Reference: [via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs)
+
+- BridgeWithdrawal OP_RETURN now supports an optional index_withdrawal (i64 LE). When present, it is parsed from OP_RETURN and attached to BridgeWithdrawalInput; when absent it is treated as 0. See [MessageParser.parse_withdrawal()](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs#L800) and [BridgeWithdrawalInput.index_withdrawal](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/types.rs#L57). Canonical OP_RETURN layout is documented in [inscription_interaction.md](inscription_interaction.md).
+#### Coordinator API lock scoping
+
+- `RestApi::new_session` now scopes the read lock when reading the current `session_op` to avoid holding the mutex across subsequent logic. See [via_verifier/node/via_verifier_coordinator/src/coordinator/api_impl.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/coordinator/api_impl.rs#L14).
+
+#### Multiple transactions per batch and session index
+
+- The withdrawal coordinator supports multiple unsigned transactions per batch; `SessionOperation` carries an `index` to select the candidate for signing. See [via_verifier/node/via_verifier_coordinator/src/types.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/types.rs).
+- Idempotency per index: `is_session_in_progress` and `is_bridge_session_already_processed` use `get_vote_transaction_bridge_tx(l1_batch_number, index)` from [`rust ViaVotesDal`](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/src/via_votes_dal.rs) to ensure a given candidate isn’t signed twice. Helper entry point: [via_verifier/node/via_verifier_coordinator/src/sessions/session_manager.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/session_manager.rs).
+- After broadcast, the selected entry is updated via [`rust ViaBridgeDal::update_bridge_tx()`](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/src/via_bridge.rs), and the unsigned transaction is recorded in the UTXO manager for accounting.
+- The split weight limit is configurable via [`rust ViaVerifierConfig::max_tx_weight()`](https://github.com/vianetwork/via-core/blob/main/core/lib/config/src/configs/via_verifier.rs).
+
+## Canonical chain gating and wallet bootstrap (commits 0087–0090, 0097–0099, 0101–0102)
+
+Verifier BTC watcher and DAL changes enforce stricter ordering and duplicate handling for L1 batches:
+- The watcher skips duplicate proof reveal txids using a DB existence check before any insert.
+- New gating requires that each new batch number equals the last canonical batch number + 1 and that its prev_l1_batch_hash matches the last canonical chain hash.
+- Genesis (batch 1) is allowed once; subsequent duplicates are ignored.
+- The DAL exposes helpers:
+  - Existence checks for batch number and proof reveal tx id
+  - Canonical head retrieval and continuity validation
+  - A canonical chain integrity report returning continuity, missing numbers and basic stats for operators
+- Finalization remains vote-threshold based; the gating only affects insertion into the votable set.
+
+Storage initialization and system wallets:
+- At startup, nodes load SystemWallets either from the DB (via_wallets table) or derive them by scanning bootstrap_txids, then persist them.
+- This makes indexer construction deterministic and removes ad‑hoc address plumbing from runtime configs.
+
+System wallet updates:
+- Both main-node and verifier watchers include a SystemWalletProcessor that parses wallet update inscriptions (sequencer/governance/bridge), persists the updated SystemWallets, and if wallets changed, re-processes the just-fetched block range so that subsequent parsing uses the new state.
+- BTC sender validates that the active inscriber address equals SystemWallets.sequencer before emitting inscriptions; otherwise, it halts with a clear error.
+
+Bridge parameters:
+- Bridge address and related thresholds moved to the dedicated bridge configuration. The verifier config additionally supports an optional bridge_address_merkle_root to validate the Taproot tree root of the bridge when applicable.
+
+Operational runbook (insertion path):
+- If batch number is not strictly next -> skip
+- If prev hash does not match canonical -> skip
+- If proof tx id already recorded -> skip
+- Otherwise, insert votable transaction and proceed with attestation collection
+
 ## 5. Implementation Details
 
 ### 5.1 Verifier Server
@@ -327,7 +374,6 @@ async fn verify_proof(
     
     // Verify the proof
     let via_proof = ViaZKProof { proof };
-    let vk_inner = via_verification::utils::load_verification_key_without_l1_check(protocol_version).await?;
     let is_valid = via_proof.verify(vk_inner)?;
     
     Ok(is_valid)
@@ -476,6 +522,20 @@ async fn process_batch_da_reference(
     Ok((blob, hash))
 }
 ```
+
+### 5.7 Governance upgrade processing (commits 0076–0077)
+
+- The Verifier’s BTC Watch includes a dedicated GovernanceUpgradesEventProcessor that:
+  - Receives a BitcoinClient to fetch the referenced proposal transaction by txid from the OP_RETURN execution message.
+  - Uses MessageParser to parse the proposal transaction into a SystemContractUpgradeProposal (witness-based) message.
+  - Builds the L2 ProtocolUpgradeTx via ViaProtocolUpgrade::create_protocol_upgrade_tx() and persists the new protocol version using protocol_versions_dal.save_protocol_version_with_tx(...).
+- Two-phase flow:
+  - Proposal inscription (witness) defines the new protocol version and system contracts.
+  - Governance execution (OP_RETURN) references the proposal txid and authorizes it via the governance UTXO set.
+- Implementation references:
+  - Indexer extraction and validators: [core/lib/via_btc_client/src/indexer/mod.rs](core/lib/via_btc_client/src/indexer/mod.rs), [core/lib/via_btc_client/src/indexer/parser.rs](core/lib/via_btc_client/src/indexer/parser.rs)
+  - Upgrade construction: [core/lib/types/src/via_protocol_upgrade.rs](core/lib/types/src/via_protocol_upgrade.rs)
+  - Watch wiring and processor: [via_verifier/node/via_btc_watch/src/lib.rs](via_verifier/node/via_btc_watch/src/lib.rs), [via_verifier/node/via_btc_watch/src/message_processors/governance_upgrade.rs](via_verifier/node/via_btc_watch/src/message_processors/governance_upgrade.rs)
 
 ### 5.7 MuSig2 Partial Signature Verification
 

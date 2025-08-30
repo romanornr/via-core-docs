@@ -153,6 +153,12 @@ pub fn into_router(self) -> axum::Router<()> {
 
 ### 4.1 REST API
 
+Session timeout gating:
+- New config [rust ViaVerifierConfig::session_timeout](/core/lib/config/src/configs/via_verifier.rs:26) controls the maximum duration of an active signing session (seconds). Default is 30; see [etc/env/base/via_verifier.toml](/etc/env/base/via_verifier.toml:48).
+- The Coordinator defers creating a new session if one is in progress and the timeout has not elapsed:
+  - Timeout predicate: [rust RestApi::is_session_timeout](/via_verifier/node/via_verifier_coordinator/src/coordinator/api_decl.rs:137)
+  - Enforcement when starting a new session: [rust RestApi::new_session](/via_verifier/node/via_verifier_coordinator/src/coordinator/api_impl.rs:151)
+
 The Coordinator exposes a REST API that Verifier nodes use to participate in signing sessions:
 
 | Endpoint | Method | Description |
@@ -442,6 +448,8 @@ pub async fn create_unsigned_tx(
 
 4. **Transaction Broadcasting**:
    - The Coordinator broadcasts the signed transaction to the Bitcoin network
+   - The verifier attempts to build and broadcast the final withdrawal transaction earlier once quorum is met; see [`via_verifier_coordinator/src/verifier/mod.rs`](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs).
+   - The DAL sets updated_at alongside bridge_tx_id and provides helpers to fetch by proof_reveal_tx_id and to update by l1_batch_number; see [via_verifier/lib/verifier_dal/src/via_votes_dal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/src/lib.rs).
 
 ```rust
 // via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs

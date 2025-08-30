@@ -14,6 +14,21 @@ This document provides comprehensive documentation for the examples and utilitie
 6. [Configuration Examples](#configuration-examples)
 7. [Best Practices](#best-practices)
 
+## Via test utils crate
+
+A helper crate provides reusable building blocks for end-to-end and integration tests:
+- Location: core/lib/via_test_utils
+- Utilities:
+  - Test Bitcoin client and sequencer inscriber helpers
+  - Bootstrap state mock with sequencer vote set
+  - Chained inscription generator that emits a sequence of L1BatchDAReference followed by ProofDAReference, returning both parsed messages and the last batch hash
+  - Test indexer constructor using the test client and parser
+
+Typical usage in watcher tests:
+- Create N chained batches starting from k, optionally seeding prev_l1_batch_hash
+- Feed all messages in order to the watcher’s VerifierMessageProcessor
+- Assert DB side-effects: existence for batches 1..N, canonical head and first not-finalized/verified queries
+
 ## ZK Proof Verification Examples
 
 ### ZK Proof Verification from Data Availability
@@ -359,6 +374,160 @@ impl MuSig2SessionManager {
     }
 }
 ```
+
+### Tip: Handling empty withdrawal transactions (MuSig2)
+- When all withdrawals fall below their fair fee share after filtering, the builder produces an unsigned transaction that is effectively empty. In this case, [rust TransactionBuilder::build_transaction_with_op_return()](via_verifier/lib/via_musig2/src/transaction_builder.rs:58) will not insert it into the UTXO manager, and [rust UnsignedBridgeTx::is_empty()](via_verifier/lib/via_verifier_types/src/transaction.rs:25) can be used by downstream code to detect and skip broadcast or session progression.
+- Recommended handling:
+  - Check empties early and return a no-op result to the coordinator
+  - Log a structured reason (e.g., “all withdrawals below fee_per_user”) for auditability
+  - Consider notifying upstream components to adjust minimum withdrawal thresholds
+
+### CLI Debug: Batch deposits and withdrawals (commits 0062, 0067)
+
+- Debug CLI commands for high-volume local testing were added:
+  - [infrastructure/via/src/debug.ts](https://github.com/vianetwork/via-core/blob/main/infrastructure/via/src/debug.ts)
+  - Shared defaults/constants: [infrastructure/via/src/constants.ts](https://github.com/vianetwork/via-core/blob/main/infrastructure/via/src/constants.ts)
+  - Wallet helpers (BIP39/BIP32 P2WPKH): [infrastructure/via/src/helpers.ts](https://github.com/vianetwork/via-core/blob/main/infrastructure/via/src/helpers.ts)
+  - Token ops (exported helpers): [infrastructure/via/src/token.ts](https://github.com/vianetwork/via-core/blob/main/infrastructure/via/src/token.ts)
+
+Commands:
+- Batch deposits to L2:
+  ```bash
+  via debug deposit-many \
+    --amount 0.10 \
+    --receiver-l2-address 0xYourL2Address \
+    --count 100 \
+    [--sender-private-key <WIF>] \
+    [--network regtest|testnet|bitcoin] \
+    [--l1-rpc-url http://0.0.0.0:18443] \
+    [--l2-rpc-url http://0.0.0.0:3050] \
+    [--rpc-username rpcuser] \
+    [--rpc-password rpcpassword]
+  ```
+  - Splits total amount evenly across count deposits using deposit() from [infrastructure/via/src/token.ts](https://github.com/vianetwork/via-core/blob/main/infrastructure/via/src/token.ts).
+
+- Batch withdrawals to random L1 addresses:
+  ```bash
+  via debug withdraw-many \
+    --amount 1.0 \
+    --count 10 \
+    [--user-private-key 0x...] \
+    [--rpc-url http://0.0.0.0:3050] \
+    [--network regtest|testnet|bitcoin]
+  ```
+  - Uses generateBitcoinWallet() to derive fresh P2WPKH addresses; logs the receiver per withdrawal.
+  - Reuses a single L2 wallet and sets sequential nonces to avoid clashes.
+
+Notes:
+- getWallet() and withdraw(..., nonce?) are exported for programmatic use; withdraw-many auto-increments nonce starting from the current account nonce.
+- Defaults for keys, RPC URLs and network are taken from [infrastructure/via/src/constants.ts](https://github.com/vianetwork/via-core/blob/main/infrastructure/via/src/constants.ts).
+
+### Transactions generator: direct host mode
+
+- You can now generate random regtest transactions either inside the compose container (default) or directly on the host, and override RPC parameters.
+- Command:
+  ```bash
+  via transactions \
+    --rpc-connect bitcoind \
+    --rpc-username rpcuser \
+    --rpc-password rpcpassword \
+    --rpc-wallet Alice \
+    --address mqdofsXHpePPGBFXuwwypAqCcXi48Xhb2f \
+    --skip-container   # run bitcoin-cli locally on the host
+  ```
+- Implementation: [`typescript generateRandomTransactions(options)`](infrastructure/via/src/transactions.ts) builds bitcoin-cli calls with a docker prefix unless --skip-container is set. Bootstrap env handling tolerates empty-string values. See [`typescript updateBootstrapTxidsEnv()`](infrastructure/via/src/bootstrap.ts).
+
+### Multisig subcommands for upgrade and system-wallet executions
+
+- The “multisig” CLI can construct, sign, finalize, and broadcast OP_RETURN governance execution transactions for:
+  - Protocol upgrade execution ("VIA_PROTOCOL:UPGRADE")
+  - Sequencer update ("VIA_PROTOCOL:SEQ")
+  - Governance update ("VIA_PROTOCOL:GOV")
+  - Bridge update execution ("VIA_PROTOCOL:BRI" referencing an UpdateBridgeProposal txid)
+
+Core helpers:
+- Compute multisig (P2WSH):
+  ```bash
+  via multisig compute-multisig \
+    --pubkeys <hexPubkey1,hexPubkey2,hexPubkey3> \
+    --minimumSigners 2 \
+    --out ./upgrade_tx_exec.json
+  ```
+
+- Create unsigned upgrade PSBT (OP_RETURN + change to P2WSH):
+  ```bash
+  via multisig create-upgrade-tx \
+    --inputTxId <tx_id> \
+    --inputVout <vout> \
+    --inputAmount <sats> \
+    --upgradeProposalTxId <proposal_txid> \
+    --fee 500 \
+    --out ./upgrade_tx_exec.json
+  ```
+
+- Create unsigned sequencer update PSBT:
+  ```bash
+  via multisig create-update-sequencer \
+    --inputTxId <tx_id> \
+    --inputVout <vout> \
+    --inputAmount <sats> \
+    --fee 500 \
+    --sequencerAddress <bcrt1...> \
+    --out ./upgrade_tx_exec.json
+  ```
+
+- Create unsigned governance update PSBT:
+  ```bash
+  via multisig create-update-governance \
+    --inputTxId <tx_id> \
+    --inputVout <vout> \
+    --inputAmount <sats> \
+    --fee 500 \
+    --governanceAddress <bcrt1...> \
+    --out ./upgrade_tx_exec.json
+  ```
+
+- Create unsigned bridge update execution PSBT:
+  ```bash
+  via multisig create-update-bridge \
+    --inputTxId <tx_id> \
+    --inputVout <vout> \
+    --inputAmount <sats> \
+    --proposalTxid <proposal_txid> \
+    --fee 500 \
+    --out ./upgrade_tx_exec.json
+  ```
+
+- Sign and finalize (renamed):
+  ```bash
+  via multisig sign-tx --privateKey <wif> --out ./upgrade_tx_exec.json
+  via multisig finalize-tx --out ./upgrade_tx_exec.json
+  via multisig broadcast-tx --rpcUrl http://0.0.0.0:18443 --rpcUser rpcuser --rpcPass rpcpassword
+  ```
+
+Constants (OP_RETURN prefixes) exposed for tooling:
+- VIA_PROTOCOL:WITHDRAWAL
+- VIA_PROTOCOL:UPGRADE
+- VIA_PROTOCOL:SEQ
+- VIA_PROTOCOL:BRI
+- VIA_PROTOCOL:GOV
+
+Sources:
+- [`typescript multisig.ts`](infrastructure/via/src/multisig.ts)
+- Helpers: [`typescript getNetwork()`](infrastructure/via/src/helpers.ts), [`typescript readJsonFile()`](infrastructure/via/src/helpers.ts), [`typescript writeJsonFile()`](infrastructure/via/src/helpers.ts)
+- Guides:
+  - Upgrade: [`markdown upgrade.md`](docs/via_guides/upgrade.md)
+  - MuSig2 wallet/system control: [`markdown musig2.md`](docs/via_guides/musig2.md)
+
+### Deposit helper requires bridge address
+
+- The debug deposit and example deposit scripts require an explicit bridge address:
+  ```bash
+  via token deposit \
+    --amount 10 \
+    --receiver-l2-address 0xYourL2 \
+    --bridge-address bcrt1p...
+  ```
 
 ## Bitcoin Client Examples
 
