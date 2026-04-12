@@ -154,7 +154,7 @@ The system provides fee estimation through the API:
    - `zks_estimateFee`: Estimates the fee for a transaction
    - `zks_getFeeParams`: Returns the current fee parameters
    - `zks_getBatchFeeInput`: Returns the current batch fee input
-   - `via_estimateDepositFee`: Estimates the fee for a Bitcoin deposit
+   - ~~`via_estimateDepositFee`~~: **Does not exist** in the codebase (fabricated by doc generator)
 
 2. **Estimation Process**:
    - The system simulates the transaction execution to determine gas usage

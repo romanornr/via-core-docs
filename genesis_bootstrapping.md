@@ -41,20 +41,21 @@ The genesis configuration is defined in YAML files and contains parameters that 
 ### Main Genesis Configuration (`etc/env/file_based/genesis.yaml`):
 
 ```yaml
-genesis_root: 0x5d1b8d6f250d89b77b66a918e3e0f60f64ca959aee0c5f1031575491fd00bfa6
+# UPDATED 2026-04-11: values below match current etc/env/file_based/genesis.yaml
+genesis_root: '0xe5130f36c084e419c99f8268d499b19e50622f4c41506439e334c2a38ac4a6f7'
 genesis_rollup_leaf_index: 54
-genesis_batch_commitment: 0xe81e1a4727269fe1ef3e2f8c3f5cfb9aab7c073722c278331b7e017033c13f8f
-genesis_protocol_semantic_version: '0.26.0'
+genesis_batch_commitment: '0x82b8670fcc6149d66ccb53705b408b66ca868b50b95cfc05a22bccef65563b6e'
+genesis_protocol_semantic_version: '0.28.0'
 # deprecated
-genesis_protocol_version: 26
-default_aa_hash: 0x010005630848b5537f934eea6bd8c61c50648a162b90c82f316454f4109462b1
-bootloader_hash: 0x010008e79c154523aa30981e598b73c4a33c304bef9c82bae7d2ca4d21daedc7
+genesis_protocol_version: 28
+default_aa_hash: '0x0100055d4fb8cb4bf017843c74ea924928235a8954b327a1e2a88a7568a04b10'
+bootloader_hash: '0x010008c3be57ae5800e077b6c2056d9d75ad1a7b4f0ce583407961cc6fe0b678'
 l1_chain_id: 9
 l2_chain_id: 270
 fee_account: '0x0000000000000000000000000000000000000001'
 prover:
-  recursion_scheduler_level_vk_hash: 0x14f97b81e54b35fe673d8708cc1a19e1ea5b5e348e12d31e39824ed4f42bbca2
   dummy_verifier: true
+  snark_wrapper_vk_hash: '0x14f97b81e54b35fe673d8708cc1a19e1ea5b5e348e12d31e39824ed4f42bbca2'
 l1_batch_commit_data_generator_mode: Rollup
 ```
 

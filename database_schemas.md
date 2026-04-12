@@ -134,235 +134,144 @@ CREATE TABLE events (
 
 ## L1 Indexer Database Schema
 
-The L1 Indexer maintains a separate database for tracking Bitcoin L1 transactions and bridge operations.
+> **CORRECTION (2026-04-11):** The previous version of this section contained entirely fabricated table definitions
+> (deposits with vout/confirmation tracking, bridge_withdrawals with JSONB signatures, withdrawals with proof_hash,
+> a key-value indexer_metadata, and a utxos tracking table). None of those tables exist in the codebase.
+> The actual schemas below are from `via_indexer/lib/via_indexer_dal/migrations/`.
+
+The L1 Indexer maintains a **separate database** (`via_indexer_dal`) for tracking Bitcoin L1 deposits and withdrawals.
 
 ### Deposits Table
 
-Tracks Bitcoin deposits to the bridge address.
+Tracks Bitcoin-to-L2 deposits.
 
 ```sql
-CREATE TABLE deposits (
-    id SERIAL PRIMARY KEY,
-    txid VARCHAR(64) NOT NULL UNIQUE,
-    vout INTEGER NOT NULL,
-    amount BIGINT NOT NULL,
-    address VARCHAR(100) NOT NULL,
-    l2_receiver_address BYTEA,
-    block_height INTEGER,
-    block_hash VARCHAR(64),
-    confirmed BOOLEAN DEFAULT FALSE,
-    processed BOOLEAN DEFAULT FALSE,
-    validation_status VARCHAR(20) DEFAULT 'pending',
-    validation_error TEXT,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW(),
-    CONSTRAINT unique_deposit UNIQUE (txid, vout)
+-- via_indexer/lib/via_indexer_dal/migrations/20250604191948_deposit_withdraw.up.sql
+CREATE TABLE IF NOT EXISTS deposits (
+    "priority_id" BIGINT NOT NULL,
+    "tx_id" BYTEA NOT NULL,
+    "block_number" BIGINT NOT NULL,
+    "sender" VARCHAR NOT NULL,
+    "receiver" VARCHAR NOT NULL,
+    "value" BIGINT NOT NULL,
+    "calldata" BYTEA,
+    "canonical_tx_hash" BYTEA NOT NULL UNIQUE,
+    "created_at" BIGINT NOT NULL,
+    PRIMARY KEY (tx_id)
 );
-
--- Indexes for efficient querying
-CREATE INDEX idx_deposits_block_height ON deposits(block_height);
-CREATE INDEX idx_deposits_confirmed ON deposits(confirmed);
-CREATE INDEX idx_deposits_processed ON deposits(processed);
-CREATE INDEX idx_deposits_address ON deposits(address);
-CREATE INDEX idx_deposits_l2_receiver ON deposits(l2_receiver_address);
-```
-
-### Bridge Withdrawals Table
-
-Tracks withdrawal transactions processed by the bridge.
-
-```sql
-CREATE TABLE bridge_withdrawals (
-    id SERIAL PRIMARY KEY,
-    txid VARCHAR(64) NOT NULL UNIQUE,
-    inscription_data TEXT,
-    inscription_content_type VARCHAR(50),
-    withdrawal_requests JSONB,
-    input_count INTEGER NOT NULL DEFAULT 1,
-    output_count INTEGER NOT NULL,
-    total_amount BIGINT NOT NULL,
-    fee_amount BIGINT,
-    block_height INTEGER,
-    block_hash VARCHAR(64),
-    confirmed BOOLEAN DEFAULT FALSE,
-    processed BOOLEAN DEFAULT FALSE,
-    musig2_signature BYTEA,
-    verifier_signatures JSONB,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-);
-
--- Indexes for efficient querying
-CREATE INDEX idx_bridge_withdrawals_block_height ON bridge_withdrawals(block_height);
-CREATE INDEX idx_bridge_withdrawals_confirmed ON bridge_withdrawals(confirmed);
-CREATE INDEX idx_bridge_withdrawals_processed ON bridge_withdrawals(processed);
-CREATE INDEX idx_bridge_withdrawals_inscription ON bridge_withdrawals USING gin(inscription_data gin_trgm_ops);
 ```
 
 ### Withdrawals Table
 
-Tracks individual withdrawal requests within bridge transactions.
+Tracks L2-to-Bitcoin withdrawal records.
 
 ```sql
-CREATE TABLE withdrawals (
-    id SERIAL PRIMARY KEY,
-    bridge_withdrawal_id INTEGER REFERENCES bridge_withdrawals(id),
-    txid VARCHAR(64) NOT NULL,
-    vout INTEGER NOT NULL,
-    amount BIGINT NOT NULL,
-    recipient_address VARCHAR(100) NOT NULL,
-    l2_batch_number BIGINT,
-    withdrawal_index INTEGER,
-    proof_hash BYTEA,
-    block_height INTEGER,
-    confirmed BOOLEAN DEFAULT FALSE,
-    processed BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW(),
-    CONSTRAINT unique_withdrawal UNIQUE (txid, vout)
+-- via_indexer/lib/via_indexer_dal/migrations/20250604191948_deposit_withdraw.up.sql
+CREATE TABLE IF NOT EXISTS withdrawals (
+    "id" VARCHAR UNIQUE NOT NULL,
+    "tx_id" BYTEA NOT NULL,
+    "l2_tx_log_index" BIGINT NOT NULL,
+    "receiver" VARCHAR NOT NULL,
+    "value" BIGINT NOT NULL,
+    "block_number" BIGINT NOT NULL,
+    "timestamp" BIGINT NOT NULL,
+    "created_at" TIMESTAMP NOT NULL DEFAULT NOW()
 );
-
--- Indexes for efficient querying
-CREATE INDEX idx_withdrawals_bridge_withdrawal ON withdrawals(bridge_withdrawal_id);
-CREATE INDEX idx_withdrawals_recipient ON withdrawals(recipient_address);
-CREATE INDEX idx_withdrawals_l2_batch ON withdrawals(l2_batch_number);
-CREATE INDEX idx_withdrawals_block_height ON withdrawals(block_height);
 ```
 
 ### Indexer Metadata Table
 
-Stores indexer state and configuration metadata.
+Tracks indexer cursor per module.
 
 ```sql
-CREATE TABLE indexer_metadata (
-    key VARCHAR(50) PRIMARY KEY,
-    value TEXT NOT NULL,
-    value_type VARCHAR(20) DEFAULT 'string',
-    description TEXT,
-    updated_at TIMESTAMP DEFAULT NOW()
+-- via_indexer/lib/via_indexer_dal/migrations/20250604192021_indexer_metadata.up.sql
+CREATE TABLE IF NOT EXISTS indexer_metadata (
+    module VARCHAR NOT NULL UNIQUE,
+    last_indexer_l1_block BIGINT NOT NULL,
+    updated_at TIMESTAMP NOT NULL
 );
-
--- Insert default metadata
-INSERT INTO indexer_metadata (key, value, value_type, description) VALUES
-('last_processed_block', '0', 'integer', 'Last Bitcoin block height processed by the indexer'),
-('indexer_version', '1.0.0', 'string', 'Version of the L1 indexer'),
-('start_block_height', '0', 'integer', 'Starting block height for indexing'),
-('confirmation_blocks', '6', 'integer', 'Number of confirmation blocks required'),
-('bridge_address', '', 'string', 'Bitcoin bridge address being monitored'),
-('network', 'regtest', 'string', 'Bitcoin network (mainnet/testnet/regtest)'),
-('indexer_status', 'stopped', 'string', 'Current status of the indexer'),
-('last_error', '', 'string', 'Last error encountered by the indexer'),
-('total_deposits_processed', '0', 'integer', 'Total number of deposits processed'),
-('total_withdrawals_processed', '0', 'integer', 'Total number of withdrawals processed');
 ```
 
-### UTXO Tracking Table
-
-Tracks available UTXOs for bridge operations.
-
-```sql
-CREATE TABLE utxos (
-    id SERIAL PRIMARY KEY,
-    txid VARCHAR(64) NOT NULL,
-    vout INTEGER NOT NULL,
-    amount BIGINT NOT NULL,
-    script_pubkey BYTEA NOT NULL,
-    address VARCHAR(100),
-    block_height INTEGER NOT NULL,
-    spent BOOLEAN DEFAULT FALSE,
-    spent_in_txid VARCHAR(64),
-    spent_in_vin INTEGER,
-    spent_block_height INTEGER,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW(),
-    CONSTRAINT unique_utxo UNIQUE (txid, vout)
-);
-
--- Indexes for efficient UTXO selection
-CREATE INDEX idx_utxos_unspent ON utxos(spent) WHERE spent = FALSE;
-CREATE INDEX idx_utxos_amount ON utxos(amount) WHERE spent = FALSE;
-CREATE INDEX idx_utxos_address ON utxos(address) WHERE spent = FALSE;
-CREATE INDEX idx_utxos_block_height ON utxos(block_height);
-```
+Note: There is no UTXO tracking table in the database. Bridge UTXO management is handled in-memory by the `UtxoManager` in `via_verifier/lib/via_musig2/src/utxo_manager.rs`, which fetches UTXOs from the Bitcoin node via RPC on each iteration.
 
 ## Verifier Database Schema
 
-The verifier system uses additional tables for managing verification processes and voting.
+> **CORRECTION (2026-04-11):** The previous version fabricated `verifier_votes`, `signing_sessions`, and
+> `verifier_registry` tables. None of those exist. The actual verifier database schema is in
+> `via_verifier/lib/verifier_dal/migrations/`. MuSig2 signing sessions are managed in-memory
+> by the coordinator, not persisted in a database table.
+
+The verifier uses a **separate database** (`verifier_dal`) with its own migration history.
+
+### Votable Transactions Table
+
+Tracks L1 batches that verifiers need to vote on.
+
+```sql
+-- via_verifier/lib/verifier_dal/migrations/20250112053854_create_via_votes.up.up.sql
+CREATE TABLE IF NOT EXISTS via_votable_transactions (
+    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    l1_batch_number BIGINT NOT NULL,
+    l1_batch_hash BYTEA UNIQUE NOT NULL,
+    prev_l1_batch_hash BYTEA NOT NULL,
+    proof_blob_id VARCHAR UNIQUE NOT NULL,
+    proof_reveal_tx_id BYTEA UNIQUE NOT NULL,
+    pubdata_blob_id VARCHAR UNIQUE NOT NULL,
+    pubdata_reveal_tx_id VARCHAR UNIQUE NOT NULL,
+    da_identifier VARCHAR NOT NULL,
+    bridge_tx_id BYTEA,
+    is_finalized BOOLEAN,
+    l1_batch_status BOOLEAN,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_via_votable_transactions_l1_batch_hash ON via_votable_transactions(l1_batch_hash);
+CREATE INDEX idx_via_votable_transactions_finalized ON via_votable_transactions (is_finalized) WHERE is_finalized IS NOT NULL;
+CREATE INDEX idx_via_votable_transactions_status ON via_votable_transactions (l1_batch_status) WHERE l1_batch_status IS NOT NULL;
+CREATE INDEX idx_via_votable_transactions_batch_tx ON via_votable_transactions (bridge_tx_id) WHERE bridge_tx_id IS NOT NULL;
+```
 
 ### Verifier Votes Table
 
-Stores votes from verifiers on L1 batches.
+Stores per-verifier votes referencing votable transactions.
 
 ```sql
-CREATE TABLE verifier_votes (
-    id SERIAL PRIMARY KEY,
-    l1_batch_number BIGINT NOT NULL,
-    verifier_address BYTEA NOT NULL,
-    vote_type VARCHAR(20) NOT NULL, -- 'approve', 'reject'
-    signature BYTEA NOT NULL,
-    timestamp TIMESTAMP NOT NULL DEFAULT NOW(),
-    block_height BIGINT,
-    CONSTRAINT unique_verifier_vote UNIQUE (l1_batch_number, verifier_address)
+-- via_verifier/lib/verifier_dal/migrations/20250112053854_create_via_votes.up.up.sql
+CREATE TABLE IF NOT EXISTS via_votes (
+    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    votable_transaction_id BIGINT NOT NULL,
+    verifier_address TEXT NOT NULL,
+    vote BOOLEAN NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE (votable_transaction_id, verifier_address)
 );
 
--- Indexes for efficient querying
-CREATE INDEX idx_verifier_votes_batch ON verifier_votes(l1_batch_number);
-CREATE INDEX idx_verifier_votes_verifier ON verifier_votes(verifier_address);
-CREATE INDEX idx_verifier_votes_type ON verifier_votes(vote_type);
+ALTER TABLE via_votes ADD FOREIGN KEY (votable_transaction_id)
+    REFERENCES via_votable_transactions (id) ON DELETE CASCADE ON UPDATE NO ACTION;
 ```
 
-### Signing Sessions Table
+### Verifier Transactions Table
 
-Tracks MuSig2 signing sessions for withdrawal transactions.
+Tracks priority transactions observed by the verifier.
 
 ```sql
-CREATE TABLE signing_sessions (
-    id SERIAL PRIMARY KEY,
-    session_id VARCHAR(64) NOT NULL UNIQUE,
-    unsigned_tx_hash BYTEA NOT NULL,
-    withdrawal_batch_id INTEGER,
-    coordinator_address BYTEA NOT NULL,
-    required_signers INTEGER NOT NULL,
-    current_signers INTEGER DEFAULT 0,
-    status VARCHAR(20) DEFAULT 'pending', -- 'pending', 'signing', 'completed', 'failed'
-    nonce_commitments JSONB,
-    partial_signatures JSONB,
-    final_signature BYTEA,
-    signed_tx_hash BYTEA,
-    broadcast_txid VARCHAR(64),
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW(),
-    expires_at TIMESTAMP
+-- via_verifier/lib/verifier_dal/migrations/20250207164238_via_add_transactions_dal.up.sql
+CREATE TABLE IF NOT EXISTS via_transactions (
+    "priority_id" BIGINT NOT NULL,
+    "tx_id" BYTEA NOT NULL,
+    "receiver" VARCHAR NOT NULL,
+    "value" BIGINT NOT NULL,
+    "calldata" BYTEA,
+    "canonical_tx_hash" BYTEA NOT NULL,
+    "status" BOOLEAN,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tx_id)
 );
-
--- Indexes for efficient querying
-CREATE INDEX idx_signing_sessions_status ON signing_sessions(status);
-CREATE INDEX idx_signing_sessions_coordinator ON signing_sessions(coordinator_address);
-CREATE INDEX idx_signing_sessions_expires ON signing_sessions(expires_at);
 ```
 
-### Verifier Registry Table
-
-Maintains the registry of active verifiers and their public keys.
-
-```sql
-CREATE TABLE verifier_registry (
-    id SERIAL PRIMARY KEY,
-    verifier_address BYTEA NOT NULL UNIQUE,
-    public_key BYTEA NOT NULL,
-    bitcoin_address VARCHAR(100) NOT NULL,
-    status VARCHAR(20) DEFAULT 'active', -- 'active', 'inactive', 'slashed'
-    stake_amount NUMERIC(80),
-    registration_block BIGINT,
-    last_activity TIMESTAMP,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-);
-
--- Indexes for efficient querying
-CREATE INDEX idx_verifier_registry_status ON verifier_registry(status);
-CREATE INDEX idx_verifier_registry_bitcoin_address ON verifier_registry(bitcoin_address);
-```
+Note: There is no `signing_sessions` or `verifier_registry` table. MuSig2 signing is coordinated in-memory by the coordinator service. Verifier registration is tracked via Bitcoin governance inscriptions and the `via_wallets` table, not a dedicated registry table.
 
 ## Protocol Version Management Schema
 
@@ -453,8 +362,8 @@ VACUUM ANALYZE storage_logs;
 -- Update table statistics
 ANALYZE transactions;
 ANALYZE l1_batches;
-ANALYZE deposits;
-ANALYZE bridge_withdrawals;
+ANALYZE via_data_availability;
+ANALYZE via_votes;
 
 -- Reindex if necessary
 REINDEX INDEX CONCURRENTLY idx_transactions_hash;

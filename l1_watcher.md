@@ -1,5 +1,12 @@
 # Via L2 Bitcoin L1 Watchtower / Listener / Indexer
 
+> **CORRECTION (2026-04-11):** This document conflates two separate services:
+> **BtcWatch** (`core/node/via_btc_watch/`) runs inside the core node and handles deposits, votes, and governance.
+> **L1 Indexer** (`via_indexer/node/indexer/`) runs as a separate binary with its own database and handles
+> deposits and withdrawals for external APIs. They share the `BitcoinInscriptionIndexer` parsing library
+> but serve different purposes and maintain separate cursors.
+> See the wiki page `via-bitcoin-watchers-btc-watch-and-l1-indexer.md` for verified documentation.
+
 ## Overview
 
 The L1 Watchtower component in Via L2 is responsible for monitoring the Bitcoin blockchain for relevant events and transactions that affect the Layer 2 system. It serves as the bridge between the Bitcoin L1 chain and the Via L2 rollup, ensuring that deposits, system messages, and other critical information are properly indexed and processed.

@@ -1,36 +1,55 @@
 # UTXO Management Documentation
 
+> **⚠ WARNING (2026-04-11):** This document was auto-generated and contains fabricated code.
+> There is no `UtxoSelector` struct and no `UtxoSelectionStrategy` enum (LargestFirst, SmallestFirst,
+> BranchAndBound, Random, Optimal) anywhere in the codebase. The actual UTXO management is in
+> `via_verifier/lib/via_musig2/src/utxo_manager.rs` and uses a simple `UtxoManager` struct with
+> a single largest-first selection strategy (sort descending, accumulate until target).
+> See the wiki page `via-btc-sender-inscription-pipeline-and-utxo-management.md` for verified documentation.
+
 ## Overview
 
-The Via Core system implements sophisticated UTXO (Unspent Transaction Output) management for efficient Bitcoin transaction construction and bridge operations. The UTXO management system handles selection, sorting, consolidation, and optimization of Bitcoin UTXOs to minimize transaction fees and maximize operational efficiency.
+Via manages Bitcoin UTXOs for bridge withdrawal transactions. The implementation is simpler than this document originally described.
 
-## Core Components
+## Actual Implementation: UtxoManager
 
-### UTXO Selector
-
-The `UtxoSelector` is the primary component responsible for selecting optimal UTXOs for transaction construction.
+The real UTXO management struct is `UtxoManager` in `via_verifier/lib/via_musig2/src/utxo_manager.rs`:
 
 ```rust
-pub struct UtxoSelector {
-    selection_strategy: UtxoSelectionStrategy,
-    dust_threshold: Amount,
-    fee_estimator: Arc<FeeEstimator>,
-    network: Network,
-}
-
-#[derive(Debug, Clone)]
-pub enum UtxoSelectionStrategy {
-    LargestFirst,
-    SmallestFirst,
-    BranchAndBound,
-    Random,
-    Optimal,
+pub struct UtxoManager {
+    btc_client: Arc<dyn BitcoinOps>,
+    context: Arc<RwLock<VecDeque<Transaction>>>,  // in-memory unconfirmed tx tracking
+    minimum_amount: Amount,                        // for UTXO consolidation
+    merge_limit: usize,                            // max UTXOs to merge at once
 }
 ```
 
-### Enhanced UTXO Selection Algorithm
+### UTXO Selection
 
-The system implements multiple selection strategies with the default being the enhanced largest-first algorithm:
+There is **one selection strategy**: sort all available UTXOs by value descending (largest first), then iterate and accumulate until the target amount is met:
+
+```rust
+pub async fn select_utxos_by_target_value(
+    &self,
+    utxos: &[(OutPoint, TxOut)],
+    target_amount: Amount,
+) -> anyhow::Result<Vec<(OutPoint, TxOut)>> {
+    let mut selected = Vec::new();
+    let mut total = Amount::ZERO;
+    for utxo in utxos {
+        selected.push(utxo.clone());
+        total = total.checked_add(utxo.1.value)
+            .ok_or_else(|| anyhow::anyhow!("Amount overflow during UTXO selection"))?;
+        if total >= target_amount { break; }
+    }
+    if total < target_amount {
+        return Err(anyhow::anyhow!("Insufficient funds: have {}, need {}", total, target_amount));
+    }
+    Ok(selected)
+}
+```
+
+### What follows below is the original auto-generated content (UNRELIABLE)
 
 ```rust
 impl UtxoSelector {

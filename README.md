@@ -4,7 +4,6 @@ description: Dive into VIA Protocol and navigate through different sections.
 
 # Introduction
 
-Welcome to the **VIA Protocol** :wave:, this documentation serves as a starting point and a comprehensive resource for interacting with VIA. Whether you're a developer exploring our [developer docs](../developer-docs), or a user getting started through our [user guide](../user-guide), this knowledge base has you covered. Additionally, you can learn more about VIA Protocol's architecture and security properties by exploring the links in the sidebar.
 
 # Via L2: A Bitcoin L2 EVM-compatible Modular Sovereign ZK‑Rollup
 

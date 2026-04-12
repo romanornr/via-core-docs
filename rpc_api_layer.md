@@ -1,5 +1,13 @@
 # Via L2 Bitcoin ZK-Rollup: RPC/API Layer Documentation
 
+> **⚠ WARNING (2026-04-11):** This document was auto-generated and contains significant fabrications.
+> The `via` namespace section (§3.2) listed 12+ methods that do not exist in the codebase.
+> The actual `via` namespace has only 2 methods: `via_getBitcoinNetwork` and `via_getDaBlobData`.
+> Code examples throughout this document (§4, §5, §6) reference nonexistent methods like
+> `via_getWalletUTXOs`, `via_getBitcoinMempoolInfo`, `via_getProtocolVersion`, and `via_getBridgeAddress`.
+> The `eth` and `zks` namespace listings are approximately correct.
+> See the wiki page `via-rpc-api-namespaces-and-method-reference.md` for verified documentation.
+
 ## 1. Overview
 
 The RPC/API Layer in Via L2 is the primary interface for users and applications to interact with the rollup. It provides a set of JSON-RPC endpoints that allow clients to query the state of the blockchain, submit transactions, and subscribe to events. The API layer is designed to be compatible with Ethereum's JSON-RPC interface, making it easy for existing Ethereum tools and libraries to work with Via L2.
@@ -62,15 +70,18 @@ Utility methods:
 
 #### `via` Namespace
 
-Via-specific methods for Bitcoin integration:
+> **CORRECTION (2026-04-11):** The previous version listed many fabricated methods. The actual `via` namespace
+> (defined in `core/lib/web3_decl/src/namespaces/via.rs`) has only **2 active methods**:
 
-- **Bitcoin Information**: `via_getBitcoinBlockNumber`, `via_getBitcoinBlock`, `via_getBitcoinTransaction`
-- **Bitcoin Mempool**: `via_getBitcoinMempoolInfo` - Retrieves Bitcoin mempool information for fee estimation and network monitoring
-- **Bridge Information**: `via_getBridgeAddress`, `via_getVerifierAddresses`
-- **Protocol Information**: `via_getProtocolVersion`, `via_getCurrentProtocolVersion`
-- **Block and Transaction Details**: `via_getBlockDetails`, `via_getTransactionDetails`, `via_getRawBlockTransactions`
-- **Deposit and Withdrawal**: `via_estimateDepositFee`, `via_getWithdrawalStatus`
-- **Coordinator API**: Enhanced signature validation endpoints with cryptographic verification
+- **`via_getBitcoinNetwork`**: Returns the Bitcoin network the node is configured for (mainnet/testnet/signet/regtest)
+- **`via_getDaBlobData`**: Retrieves raw DA blob data for a given blob_id (returns `DaBlobData` with is_proof, pub_data, proof_data)
+
+The following methods from the previous version **do not exist** in the codebase:
+`via_getBitcoinBlockNumber`, `via_getBitcoinBlock`, `via_getBitcoinTransaction`,
+`via_getBitcoinMempoolInfo`, `via_getBridgeAddress` (commented out), `via_getVerifierAddresses`,
+`via_getProtocolVersion`, `via_getCurrentProtocolVersion`, `via_getBlockDetails`,
+`via_getTransactionDetails`, `via_getRawBlockTransactions`, `via_estimateDepositFee`,
+`via_getWithdrawalStatus`. These were hallucinated by the documentation generator.
 
 #### `zks` Namespace
 

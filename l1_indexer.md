@@ -1,5 +1,12 @@
 # Via L2 Bitcoin L1 Indexer System
 
+> **Note (2026-04-11):** This document's description of the L1 Indexer as a separate service is correct.
+> However, it overstates the indexer's complexity — the real schema has only 3 tables (deposits,
+> withdrawals, indexer_metadata), not the elaborate schema implied here. The deposit/withdrawal
+> processor logic is simpler than described. The indexer database has no bridge_withdrawals,
+> utxos, or validation workflow tables.
+> See the wiki page `via-bitcoin-watchers-btc-watch-and-l1-indexer.md` for verified documentation.
+
 ## Overview
 
 The Via L1 Indexer is a specialized Bitcoin blockchain indexing service that complements the existing L1 Watcher by providing dedicated indexing capabilities for deposits and withdrawals. This system was introduced to enhance the Via L2 architecture with more efficient and scalable Bitcoin transaction processing.

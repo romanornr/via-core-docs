@@ -1,5 +1,8 @@
 # P2P Networking Layer in Via L2 Bitcoin ZK-Rollup
 
+> **Note (2026-04-11):** The core finding of this document is correct — Via has no P2P layer.
+> All node communication is client-server (JSON-RPC, REST APIs). This has been verified.
+
 ## Executive Summary
 
 After a comprehensive analysis of the Via L2 Bitcoin ZK-Rollup codebase, I have found **no evidence of a dedicated peer-to-peer (P2P) networking layer** for direct communication between distributed nodes. The system primarily relies on client-server communication patterns using REST APIs and JSON-RPC, with centralized coordination components managing the interactions between different node types.
