@@ -80,19 +80,21 @@ This enum represents different types of proofs generated during the proving proc
 
 ### 2.3 Verification Proof Structure
 
-For verification, the system uses a specialized proof structure:
+For verification, the system uses a specialized proof structure. The `via_verification` library is organized **per protocol version** (`src/version_27/`, `src/version_28/`, each with its own `proof.rs`, `verification.rs`, `crypto.rs`, `public_inputs.rs`), so verification logic and keys can change across upgrades:
 
 ```rust
-// via_verifier/lib/via_verification/src/proof.rs
+// via_verifier/lib/via_verification/src/version_28/proof.rs
+/// A struct representing an L1 batch proof.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ViaZKProof {
     pub proof: ZkSyncProof<Bn256, ZkSyncSnarkWrapperCircuit>,
 }
 ```
 
-This structure wraps the ZK proof for verification purposes, implementing the `ProofTrait` interface:
+This structure wraps the ZK proof for verification purposes, implementing the `ProofTrait` interface (defined per version module):
 
 ```rust
-// via_verifier/lib/via_verification/src/proof.rs
+// via_verifier/lib/via_verification/src/version_28/proof.rs
 pub trait ProofTrait {
     fn verify(
         &self,
@@ -101,6 +103,8 @@ pub trait ProofTrait {
     fn get_public_inputs(&self) -> &[Fr];
 }
 ```
+
+The per-version entry point is `verify_proof` in the module root (for example `version_28/mod.rs`), used by the node, the `zk_v27.rs`/`zk_v28.rs` examples, and the bundled verification CLI.
 
 ## 3. Proof Generation Inputs and Outputs
 
@@ -295,7 +299,14 @@ sequenceDiagram
 4. The Verifier retrieves the proof and batch data from Celestia
 5. The Verifier performs batch ZK proof verification
 6. The Verifier sends an attestation inscription to Bitcoin (true/false)
-7. Once a majority of attestations indicate the proof is valid, the L1 batch is considered final
+7. The batch is finalized once Ok attestations reach at least 2/3 of the verifier set. The threshold is a shared constant, not a simple majority:
+
+```rust
+// core/lib/via_consensus/src/consensus.rs
+pub const BATCH_FINALIZATION_THRESHOLD: f64 = 0.66;
+```
+
+Every node computes finalization independently from the on-chain votes (`finalize_transaction_if_needed` in the votes DAL, invoked by the BTC watch's verifier message processor), so "final" is a deterministic function of Bitcoin state rather than a sequencer decision.
 
 ### 5.3 Celestia Data Availability Integration
 
@@ -317,10 +328,10 @@ The system uses Celestia as a Data Availability (DA) layer to ensure that both L
 
 ### 6.1 Verification Process
 
-The verification process is implemented in the `ViaZKProof` class:
+The verification process is implemented in `ViaZKProof::verify` (per version module):
 
 ```rust
-// via_verifier/lib/via_verification/src/proof.rs
+// via_verifier/lib/via_verification/src/version_28/proof.rs
 fn verify(
     &self,
     vk: VerificationKey<Bn256, ZkSyncSnarkWrapperCircuit>,
@@ -347,7 +358,7 @@ The verification process involves:
 Verification keys are loaded based on the protocol version:
 
 ```rust
-// via_verifier/lib/via_verification/src/verification.rs
+// via_verifier/lib/via_verification/src/version_28/verification.rs
 pub async fn verify_snark<P: ProofTrait, F: L1DataFetcher>(
     l1_data_fetcher: &F,
     proof: P,
@@ -406,8 +417,9 @@ pub async fn verify_snark<P: ProofTrait, F: L1DataFetcher>(
 ### 7.3 Verifier Components
 
 1. **Verification Library** (`via_verifier/lib/via_verification/`):
-   - `proof.rs`: Defines the proof verification interface
-   - `verification.rs`: Implements the verification process
+   - `src/version_27/`, `src/version_28/`: per-protocol-version modules, each with `proof.rs` (verification interface), `verification.rs` (verification process), `crypto.rs`, `public_inputs.rs`, `l1_data_fetcher.rs`
+   - `data/`: bundled verification keys
+   - `examples/zk_v27.rs`, `examples/zk_v28.rs`, `examples/zksync-era-verification-cli/`: runnable verification outside the node
 
 2. **ZK Verifier** (`via_verifier/node/via_zk_verifier/`):
    - Handles the verification of ZK proofs

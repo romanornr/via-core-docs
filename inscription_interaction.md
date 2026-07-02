@@ -80,7 +80,24 @@ The commit transaction creates a P2TR (Pay-to-Taproot) output that commits to th
 
 ## Inscription Types
 
-Via L2 supports eight types of inscriptions, each serving a specific purpose in the system:
+Two enums in `types.rs` define the message universe, and they are not the same:
+
+- **`InscriptionMessage`** (7 variants): what system actors can *create and inscribe* via the Inscriber
+- **`FullInscriptionMessage`** (12 variants): everything the indexer can *parse from Bitcoin*, which adds the OP_RETURN-based execution/observation messages
+
+### Inscribable types (`InscriptionMessage`)
+
+```rust
+pub enum InscriptionMessage {
+    L1BatchDAReference(L1BatchDAReferenceInput),
+    ProofDAReference(ProofDAReferenceInput),
+    ValidatorAttestation(ValidatorAttestationInput),
+    SystemBootstrapping(SystemBootstrappingInput),
+    L1ToL2Message(L1ToL2MessageInput),
+    SystemContractUpgradeProposal(SystemContractUpgradeProposalInput),
+    UpdateBridgeProposal(UpdateBridgeProposalInput),
+}
+```
 
 1. **L1BatchDAReference**: Commits L1 batch data availability information
    ```rust
@@ -102,7 +119,7 @@ Via L2 supports eight types of inscriptions, each serving a specific purpose in 
    }
    ```
 
-3. **ValidatorAttestation**: Contains validator attestations for batch validation
+3. **ValidatorAttestation**: Verifier vote (Ok / NotOk) referencing a proof inscription
    ```rust
    pub struct ValidatorAttestationInput {
        pub reference_txid: Txid,
@@ -110,25 +127,23 @@ Via L2 supports eight types of inscriptions, each serving a specific purpose in 
    }
    ```
 
-4. **SystemBootstrapping**: Contains system bootstrapping data
+4. **SystemBootstrapping**: Genesis configuration; establishes every trust anchor
    ```rust
    pub struct SystemBootstrappingInput {
        pub start_block_height: u32,
-       pub verifier_p2wpkh_addresses: Vec<BitcoinAddress<NetworkUnchecked>>,
-       pub bridge_musig2_address: BitcoinAddress<NetworkUnchecked>,
+       pub protocol_version: ProtocolSemanticVersion,
        pub bootloader_hash: H256,
        pub abstract_account_hash: H256,
+       pub snark_wrapper_vk_hash: H256,
+       pub evm_emulator_hash: H256,
+       pub governance_address: BitcoinAddress<NetworkUnchecked>,
+       pub sequencer_address: BitcoinAddress<NetworkUnchecked>,
+       pub bridge_musig2_address: BitcoinAddress<NetworkUnchecked>,
+       pub verifier_p2wpkh_addresses: Vec<BitcoinAddress<NetworkUnchecked>>,
    }
    ```
 
-5. **ProposeSequencer**: Contains sequencer proposal data
-   ```rust
-   pub struct ProposeSequencerInput {
-       pub sequencer_new_p2wpkh_address: BitcoinAddress<NetworkUnchecked>,
-   }
-   ```
-
-6. **L1ToL2Message**: Contains L1 to L2 message data
+5. **L1ToL2Message**: Deposit / cross-layer message data
    ```rust
    pub struct L1ToL2MessageInput {
        pub receiver_l2_address: EVMAddress,
@@ -137,56 +152,70 @@ Via L2 supports eight types of inscriptions, each serving a specific purpose in 
    }
    ```
 
-7. **SystemContractUpgradeProposal**: Witness-based proposal inscription
-```rust
-pub struct SystemContractUpgradeProposalInput {
-    /// New protocol version
-    pub version: ProtocolSemanticVersion,
-    /// New bootloader code hash
-    pub bootloader_code_hash: H256,
-    /// New default account code hash
-    pub default_account_code_hash: H256,
-    /// System contracts to upgrade (address, new hash)
-    pub system_contracts: Vec<(EVMAddress, H256)>,
-}
-```
+6. **SystemContractUpgradeProposal**: Witness-based protocol upgrade proposal
+   ```rust
+   pub struct SystemContractUpgradeProposalInput {
+       pub version: ProtocolSemanticVersion,
+       pub bootloader_code_hash: H256,
+       pub default_account_code_hash: H256,
+       pub evm_emulator_code_hash: Option<H256>,
+       pub recursion_scheduler_level_vk_hash: H256,
+       pub system_contracts: Vec<(EVMAddress, H256)>,
+   }
+   ```
 
-8. **SystemContractUpgrade**: Governance execution (OP_RETURN)
+7. **UpdateBridgeProposal**: Witness-based bridge migration proposal. Note the naming quirk: the Rust enum variant is `UpdateBridgeProposal` but its on-wire message tag is `UpgradeBridgeProposal`.
+   ```rust
+   pub struct UpdateBridgeProposalInput {
+       pub bridge_musig2_address: BitcoinAddress<NetworkUnchecked>,
+       pub verifier_p2wpkh_addresses: Vec<BitcoinAddress<NetworkUnchecked>>,
+   }
+   ```
+
+> There is no `ProposeSequencer` variant in either enum anymore. Sequencer rotation is done through the `VIA_PROTOCOL:SEQ` OP_RETURN flow (`UpdateSequencer`); the legacy `ProposeSequencerMessage` wire string still exists in `types.rs` for parsing compatibility only.
+
+### Indexed-only types (`FullInscriptionMessage` extras)
+
+The indexer additionally produces these variants, which are never created through the Inscriber. They are OP_RETURN transactions (or, for `BridgeWithdrawal`, the bridge's own spend) detected on Bitcoin:
+
+| Variant | Trigger | Purpose |
+|---------|---------|---------|
+| `SystemContractUpgrade` | `VIA_PROTOCOL:UPGRADE` OP_RETURN referencing a proposal txid | Executes an upgrade proposal (post-governance) |
+| `UpdateBridge` | `VIA_PROTOCOL:BRI` OP_RETURN referencing a proposal txid | Executes a bridge migration proposal |
+| `UpdateSequencer` | `VIA_PROTOCOL:SEQ` OP_RETURN | Rotates the sequencer address |
+| `UpdateGovernance` | `VIA_PROTOCOL:GOV` OP_RETURN | Rotates the governance address |
+| `BridgeWithdrawal` | `VIA_WI` OP_RETURN in a bridge spend | Records an executed withdrawal batch |
+
+The `SystemContractUpgrade` execution message carries the authorizing UTXOs and the proposal reference:
+
 ```rust
 pub struct SystemContractUpgradeInput {
-    /// The input UTXOs that authorize the governance execution
+    /// The input utxos.
     pub inputs: Vec<OutPoint>,
-    /// The txid of the previously inscribed upgrade proposal
+    /// The proposal tx_id.
     pub proposal_tx_id: Txid,
 }
 ```
 
-9. System wallet updates
-   - UpdateSequencer (witness-based proposal) defines a new sequencer P2WPKH address. Governance then executes an OP_RETURN message to apply it.
-   - UpdateGovernance (OP_RETURN execution) carries the new governance address.
-   - UpdateBridge uses a two-phase flow similar to upgrades:
-     - UpdateBridgeProposal (witness) proposes a new bridge MuSig2 address and a verifier set.
-     - UpdateBridge (OP_RETURN) references the proposal by txid and authorizes it via governance inputs.
+OP_RETURN prefix constants (all in `indexer/parser.rs`):
 
-OP_RETURN execution prefixes (ASCII):
-- "VIA_PROTOCOL:SEQ" for sequencer updates
-- "VIA_PROTOCOL:GOV" for governance updates
-- "VIA_PROTOCOL:BRI" for bridge updates
-- "VIA_PROTOCOL:UPGRADE" for protocol upgrades (existing)
+```rust
+const OP_RETURN_WITHDRAW_PREFIX: &[u8] = b"VIA_WI";
+const OP_RETURN_UPGRADE_PROTOCOL_PREFIX: &[u8] = b"VIA_PROTOCOL:UPGRADE";
+const OP_RETURN_UPDATE_SEQUENCER_PREFIX: &[u8] = b"VIA_PROTOCOL:SEQ";
+const OP_RETURN_UPDATE_BRIDGE_PREFIX: &[u8] = b"VIA_PROTOCOL:BRI";
+const OP_RETURN_UPDATE_GOVERNANCE_PREFIX: &[u8] = b"VIA_PROTOCOL:GOV";
+```
 
-Layouts:
-- UpdateSequencer: OP_RETURN <prefix> <new_sequencer_address_utf8>
-- UpdateGovernance: OP_RETURN <prefix> <new_governance_address_utf8>
-- UpdateBridge: OP_RETURN <prefix> <32‑byte proposal_tx_id> (little‑endian as used by Bitcoinjs embed in tooling)
-- Upgrade execution: OP_RETURN <prefix> <32‑byte proposal_tx_id>
+### Wire message tags
 
-Each inscription type has a corresponding message identifier defined as a static `PushBytesBuf` value:
+Each witness-based inscription type has a message identifier defined as a static `PushBytesBuf` value in `types.rs`:
 
 ```rust
 pub static ref SYSTEM_BOOTSTRAPPING_MSG: PushBytesBuf =
     PushBytesBuf::from(b"SystemBootstrappingMessage");
 pub static ref PROPOSE_SEQUENCER_MSG: PushBytesBuf =
-    PushBytesBuf::from(b"ProposeSequencerMessage");
+    PushBytesBuf::from(b"ProposeSequencerMessage"); // legacy, parse-only
 pub static ref VALIDATOR_ATTESTATION_MSG: PushBytesBuf =
     PushBytesBuf::from(b"ValidatorAttestationMessage");
 pub static ref L1_BATCH_DA_REFERENCE_MSG: PushBytesBuf =
@@ -195,43 +224,53 @@ pub static ref PROOF_DA_REFERENCE_MSG: PushBytesBuf =
     PushBytesBuf::from(b"ProofDAReferenceMessage");
 pub static ref L1_TO_L2_MSG: PushBytesBuf = PushBytesBuf::from(b"L1ToL2Message");
 pub static ref SYSTEM_CONTRACT_UPGRADE_MSG: PushBytesBuf =
-    PushBytesBuf::from(b"SystemContractUpgrade");
+    PushBytesBuf::from(b"SystemContractUpgradeProposal");
+pub static ref UPGRADE_BRIDGE_MSG: PushBytesBuf =
+    PushBytesBuf::from(b"UpgradeBridgeProposal");
 ```
-### BridgeWithdrawal inscription (OP_RETURN)
+### BridgeWithdrawal message (OP_RETURN)
 
-BridgeWithdrawal messages are also supported via OP_RETURN. The layout includes an optional withdrawal index for ordering/diagnostics.
+When the bridge executes a withdrawal batch, the transaction carries a `VIA_WI`-prefixed OP_RETURN output. The indexer detects it via `parse_op_return_withdrawal()` (`indexer/parser.rs`).
 
-Layout (little endian where noted):
-1) Prefix bytes: VIA_PROTOCOL:WITHDRAWAL: (implementation constant: OP_RETURN_WITHDRAW_PREFIX)
-2) 1-byte tag/reserved (implementation detail; currently ignored)
-3) 32 bytes l1_batch_proof_reveal_tx_id
-4) Optional 8 bytes index_withdrawal (i64 LE). When absent, treat as 0.
+Layout of the OP_RETURN payload:
+1. Prefix bytes: `VIA_WI` (`OP_RETURN_WITHDRAW_PREFIX`)
+2. 1 version byte, parsed into `WithdrawalVersion` (unknown versions are rejected)
+3. Version-dependent withdrawals metadata, decoded by `parse_withdrawals()`
 
-Parser
-- The parser tolerates shorter OP_RETURN payloads and conditionally reads the 8-byte index when present:
-  - [rust MessageParser::parse_bridge_withdrawal() bounds and optional index read](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs#L793)
-  - [rust MessageParser index_withdrawal LE parse](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs#L800)
+The parser then walks the transaction's outputs (skipping the bridge's own change output) to recover the individual recipients and amounts. The parsed result:
 
-Carrier type
-- The parsed index is carried on the message struct:
-  - [rust BridgeWithdrawalInput.index_withdrawal](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/types.rs#L57)
+```rust
+pub struct BridgeWithdrawalInput {
+    /// The withdrawal version.
+    pub version: WithdrawalVersion,
+    /// The tx total size.
+    pub total_size: i64,
+    /// The transaction virtual size.
+    pub v_size: i64,
+    /// The input utxos.
+    pub inputs: Vec<OutPoint>,
+    /// The total amount out.
+    pub output_amount: u64,
+    /// The list of withdrawals.
+    pub withdrawals: Vec<L1Withdrawal>,
+}
+```
 
 ### Upgrade Protocol inscription (OP_RETURN)
 
 - The execution transaction for governance upgrades is an OP_RETURN with a fixed ASCII prefix and a 32-byte proposal txid.
 
 Layout:
-1) Prefix bytes: "VIA_PROTOCOL:UPGRADE" (implementation constant OP_RETURN_UPGRADE_PREFIX)
+1) Prefix bytes: `VIA_PROTOCOL:UPGRADE` (`OP_RETURN_UPGRADE_PROTOCOL_PREFIX`)
 2) 1-byte separator/reserved
 3) 32 bytes proposal_tx_id
 
 Parser:
-- [`rust MessageParser::parse_protocol_upgrade_transaction()`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs) dispatches to:
-  - [`rust MessageParser::parse_op_return_protocol_upgrade()`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs) which extracts the proposal txid and assembles a SystemContractUpgrade message with input OutPoints from the execution tx.
+- `MessageParser::parse_protocol_upgrade_transaction()` (`indexer/parser.rs`) extracts the proposal txid and assembles a `SystemContractUpgrade` message with the input OutPoints from the execution tx.
 
 Indexer extraction:
-- [`rust BitcoinInscriptionIndexer::extract_important_transactions()`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/mod.rs) now returns (gov_txs, system_txs, bridge_txs), where gov_txs are outputs to the configured governance address.
-- Validity check: [`rust BitcoinInscriptionIndexer::is_valid_gov_message()`](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/mod.rs) ensures the referenced input belongs to the governance address.
+- `BitcoinInscriptionIndexer::extract_important_transactions()` (`indexer/mod.rs`) returns (gov_txs, system_txs, bridge_txs), where gov_txs are transactions paying the configured governance address.
+- Validity check: `BitcoinInscriptionIndexer::is_valid_gov_message()` ensures the referenced input belongs to the governance address.
 
 ## Inscription Creation Process
 
@@ -466,18 +505,17 @@ The inscription handling is integrated with other components of the Via L2 syste
    }
    ```
 
-3. **DataAvailabilityDispatcherLayer**: Handles data availability for batch data and proofs
+3. **DataAvailabilityDispatcherLayer**: Handles data availability for batch data and proofs. Note the real-proof flag comes from the Celestia config, not the BTC sender config:
    ```rust
    fn add_da_dispatcher_layer(mut self) -> anyhow::Result<Self> {
        let state_keeper_config = try_load_config!(self.configs.state_keeper_config);
        let da_config = try_load_config!(self.configs.da_dispatcher_config);
-       let btc_sender_config = try_load_config!(self.configs.via_btc_sender_config);
+       let via_celestia_config = try_load_config!(self.configs.via_celestia_config);
 
-       let dispatch_real_proof = btc_sender_config.proof_sending_mode != ProofSendingMode::SkipEveryProof;
        self.node.add_layer(DataAvailabilityDispatcherLayer::new(
            state_keeper_config,
            da_config,
-           dispatch_real_proof,
+           via_celestia_config.proof_sending_mode == ProofSendingMode::OnlyRealProofs,
        ));
 
        Ok(self)
@@ -488,4 +526,4 @@ These components work together to provide a complete system for creating, broadc
 
 ---
 
-In summary, Via L2 uses a custom inscription protocol on Bitcoin L1 to commit state and operational data, supporting six types of inscriptions for different purposes. The system also supports standard Bitcoin inscriptions for L1-to-L2 messaging, providing a comprehensive approach to leveraging Bitcoin's security and immutability for the L2 rollup.
+In summary, Via L2 uses a custom inscription protocol on Bitcoin L1 to commit state and operational data: seven inscribable message types (created via the commit/reveal Inscriber) plus five OP_RETURN-based message types that only the indexer produces. Together they cover batch/proof commitments, attestation votes, bootstrapping, deposits, governance, and withdrawal records, leveraging Bitcoin's security and immutability for the L2 rollup.

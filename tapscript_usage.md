@@ -94,25 +94,23 @@ Via L2 supports several types of inscriptions, each serving a specific purpose i
    }
    ```
 
-4. **SystemBootstrapping**: Contains system bootstrapping data
+4. **SystemBootstrapping**: Genesis configuration; establishes every trust anchor
    ```rust
    pub struct SystemBootstrappingInput {
        pub start_block_height: u32,
-       pub verifier_p2wpkh_addresses: Vec<BitcoinAddress<NetworkUnchecked>>,
-       pub bridge_musig2_address: BitcoinAddress<NetworkUnchecked>,
+       pub protocol_version: ProtocolSemanticVersion,
        pub bootloader_hash: H256,
        pub abstract_account_hash: H256,
+       pub snark_wrapper_vk_hash: H256,
+       pub evm_emulator_hash: H256,
+       pub governance_address: BitcoinAddress<NetworkUnchecked>,
+       pub sequencer_address: BitcoinAddress<NetworkUnchecked>,
+       pub bridge_musig2_address: BitcoinAddress<NetworkUnchecked>,
+       pub verifier_p2wpkh_addresses: Vec<BitcoinAddress<NetworkUnchecked>>,
    }
    ```
 
-5. **ProposeSequencer**: Contains sequencer proposal data
-   ```rust
-   pub struct ProposeSequencerInput {
-       pub sequencer_new_p2wpkh_address: BitcoinAddress<NetworkUnchecked>,
-   }
-   ```
-
-6. **L1ToL2Message**: Contains L1 to L2 message data
+5. **L1ToL2Message**: Deposit / cross-layer message data
    ```rust
    pub struct L1ToL2MessageInput {
        pub receiver_l2_address: EVMAddress,
@@ -121,13 +119,37 @@ Via L2 supports several types of inscriptions, each serving a specific purpose i
    }
    ```
 
+6. **SystemContractUpgradeProposal**: Witness-based protocol upgrade proposal
+   ```rust
+   pub struct SystemContractUpgradeProposalInput {
+       pub version: ProtocolSemanticVersion,
+       pub bootloader_code_hash: H256,
+       pub default_account_code_hash: H256,
+       pub evm_emulator_code_hash: Option<H256>,
+       pub recursion_scheduler_level_vk_hash: H256,
+       pub system_contracts: Vec<(EVMAddress, H256)>,
+   }
+   ```
+
+7. **UpdateBridgeProposal**: Witness-based bridge migration proposal (on-wire tag: `UpgradeBridgeProposal`)
+   ```rust
+   pub struct UpdateBridgeProposalInput {
+       pub bridge_musig2_address: BitcoinAddress<NetworkUnchecked>,
+       pub verifier_p2wpkh_addresses: Vec<BitcoinAddress<NetworkUnchecked>>,
+   }
+   ```
+
+See `inscription_interaction.md` for the full type catalog, including the OP_RETURN-based execution messages.
+
+> There is no `ProposeSequencer` inscription type anymore; sequencer rotation happens via the `VIA_PROTOCOL:SEQ` OP_RETURN flow.
+
 Each inscription type has a corresponding message identifier defined as a static `PushBytesBuf` value:
 
 ```rust
 pub static ref SYSTEM_BOOTSTRAPPING_MSG: PushBytesBuf =
     PushBytesBuf::from(b"SystemBootstrappingMessage");
 pub static ref PROPOSE_SEQUENCER_MSG: PushBytesBuf =
-    PushBytesBuf::from(b"ProposeSequencerMessage");
+    PushBytesBuf::from(b"ProposeSequencerMessage"); // legacy, parse-only
 pub static ref VALIDATOR_ATTESTATION_MSG: PushBytesBuf =
     PushBytesBuf::from(b"ValidatorAttestationMessage");
 pub static ref L1_BATCH_DA_REFERENCE_MSG: PushBytesBuf =
@@ -135,6 +157,10 @@ pub static ref L1_BATCH_DA_REFERENCE_MSG: PushBytesBuf =
 pub static ref PROOF_DA_REFERENCE_MSG: PushBytesBuf =
     PushBytesBuf::from(b"ProofDAReferenceMessage");
 pub static ref L1_TO_L2_MSG: PushBytesBuf = PushBytesBuf::from(b"L1ToL2Message");
+pub static ref SYSTEM_CONTRACT_UPGRADE_MSG: PushBytesBuf =
+    PushBytesBuf::from(b"SystemContractUpgradeProposal");
+pub static ref UPGRADE_BRIDGE_MSG: PushBytesBuf =
+    PushBytesBuf::from(b"UpgradeBridgeProposal");
 ```
 
 ## Tapscript Construction
@@ -227,46 +253,54 @@ let control_block = match ControlBlock::decode(&witness[2]) {
 
 Via L2 uses MuSig2 for creating Taproot signatures, with the Taproot tweak applied to the aggregated public key. This is implemented in the `via_musig2` module.
 
-The `Signer::new` method in `via_musig2/src/lib.rs` shows how the Taproot tweak is calculated and applied:
+The `Signer::new` method in `via_musig2/src/lib.rs` shows how the Taproot tweak is calculated and applied. The tweak takes an optional script-tree `merkle_root` (used when the bridge address commits to a governance script path); passing `None` yields a key-path-only output:
 
 ```rust
 // Convert to bitcoin XOnlyPublicKey first
 let internal_key = bitcoin::XOnlyPublicKey::from_slice(&xonly_agg_key.serialize())?;
 
 // Calculate taproot tweak
-let tap_tweak = TapTweakHash::from_key_and_tweak(internal_key, None);
+let tap_tweak = TapTweakHash::from_key_and_tweak(internal_key, merkle_root);
 let tweak = tap_tweak.to_scalar();
 let tweak_bytes = tweak.to_be_bytes();
-let musig2_compatible_tweak = secp256k1_musig2::Scalar::from_be_bytes(tweak_bytes).unwrap();
+let musig2_compatible_tweak = secp256k1_musig2::Scalar::from_be_bytes(tweak_bytes)?;
 // Apply tweak to the key aggregation context before signing
 musig_key_agg_cache = musig_key_agg_cache
     .with_xonly_tweak(musig2_compatible_tweak)?;
 ```
 
-This ensures that the MuSig2 signatures are compatible with Taproot's key path spending.
+This ensures that the MuSig2 signatures are compatible with Taproot's key path spending, and that the same `merkle_root` used to derive the bridge address is used at signing time (a mismatch makes signatures invalid for the address).
 
 ## Bridge Functionality
 
 The bridge component uses Taproot/Tapscript for secure multi-signature operations for deposits and withdrawals. The `via_withdrawal_client` module contains code for parsing withdrawal messages and creating withdrawal transactions.
 
-The `TransactionBuilder` in `via_musig2/src/transaction_builder.rs` shows how transactions are built and signed using Taproot signatures:
+The `TransactionBuilder` in `via_musig2/src/transaction_builder.rs` computes the Taproot key-spend sighashes for signing. The current API is plural: `get_tr_sighashes()` returns one sighash per transaction input (each input must be signed over its own sighash), replacing the older single-input `get_tr_sighash()`:
 
 ```rust
-pub fn get_tr_sighash(&self, unsigned_tx: &UnsignedBridgeTx) -> anyhow::Result<TapSighash> {
+pub fn get_tr_sighashes(&self, unsigned_tx: &UnsignedBridgeTx) -> Result<Vec<Vec<u8>>> {
     let mut sighash_cache = SighashCache::new(&unsigned_tx.tx);
     let sighash_type = TapSighashType::All;
-    let mut txout_list = Vec::with_capacity(unsigned_tx.utxos.len());
 
-    for (_, txout) in unsigned_tx.utxos.clone() {
-        txout_list.push(txout);
+    let txout_list: Vec<TxOut> = unsigned_tx
+        .utxos
+        .iter()
+        .map(|(_, txout)| txout.clone())
+        .collect();
+
+    let mut sighashes = Vec::new();
+    for (i, _) in txout_list.iter().enumerate() {
+        let sighash = sighash_cache
+            .taproot_key_spend_signature_hash(i, &Prevouts::All(&txout_list), sighash_type)
+            .context("Error taproot_key_spend_signature_hash")?;
+        sighashes.push(sighash.to_raw_hash().to_byte_array().to_vec());
     }
-    let sighash = sighash_cache
-        .taproot_key_spend_signature_hash(0, &Prevouts::All(&txout_list), sighash_type)
-        .with_context(|| "Error taproot_key_spend_signature_hash")?;
 
-    Ok(sighash)
+    Ok(sighashes)
 }
 ```
+
+Each input's sighash is signed in its own MuSig2 session: the withdrawal verifier keeps one `Signer` per UTXO input (`signer_per_utxo_input: BTreeMap<usize, Signer>` in `via_verifier_coordinator/src/verifier/mod.rs`).
 
 ## Code References
 

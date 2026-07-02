@@ -183,8 +183,8 @@ sequenceDiagram
     Sequencer->>Bitcoin: Inscribe batch metadata
     Prover->>Sequencer: Fetch batch data
     Prover->>Prover: Generate ZK proof
-    Prover->>Celestia: Publish proof data
-    Prover->>Bitcoin: Inscribe proof metadata
+    Sequencer->>Celestia: Publish proof data (DA dispatcher)
+    Sequencer->>Bitcoin: Inscribe proof metadata (BTC sender)
     Verifier->>Bitcoin: Detect proof inscription
     Verifier->>Celestia: Retrieve proof data
     Verifier->>Verifier: Verify ZK proof
@@ -264,9 +264,11 @@ The system uses advanced cryptographic techniques:
 ### 5.3 Verifier Network Security
 
 The Verifier Network provides additional security:
-- **Distributed Verification**: Multiple verifiers validate proofs
-- **Threshold Signatures**: Withdrawals require signatures from a threshold of verifiers
-- **Attestation Consensus**: Batches are finalized only after a majority of attestations
+- **Distributed Verification**: Multiple verifiers validate proofs independently
+- **n-of-n Signatures**: Withdrawals require MuSig2 signatures from **every** verifier (the full set, not a threshold)
+- **Attestation Consensus**: Batches are finalized once Ok attestations reach at least 2/3 of the verifier set (`BATCH_FINALIZATION_THRESHOLD = 0.66` in `core/lib/via_consensus`)
+
+Note the two different bars: finalizing a batch takes 2/3 of attestations; moving bridge funds takes all verifiers.
 
 ### 5.4 Data Availability
 
@@ -282,9 +284,9 @@ The Via L2 Bitcoin ZK-Rollup introduces several innovative architectural feature
 ### 6.1 Bitcoin-Native Integration
 
 Unlike most ZK-rollups that are built on Ethereum, Via L2 is designed specifically for Bitcoin. It leverages Bitcoin's native capabilities:
-- **Inscriptions**: Used for publishing metadata and attestations
-- **Taproot**: Enables efficient MuSig2 multi-signatures
-- **OP_RETURN**: Used for withdrawal references
+- **Inscriptions**: Used for publishing metadata and attestations (Taproot commit/reveal, witness-embedded)
+- **Taproot**: Enables efficient MuSig2 key-path spends for the bridge
+- **OP_RETURN**: Used for withdrawal identification (`VIA_WI`) and governance execution messages (`VIA_PROTOCOL:*`)
 
 ### 6.2 Separation of Data Availability
 

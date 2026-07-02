@@ -1,32 +1,97 @@
-# UTXO Management Documentation
+# UTXO Management
 
-> **⚠ WARNING (2026-04-11):** This document was auto-generated and contains fabricated code.
-> There is no `UtxoSelector` struct and no `UtxoSelectionStrategy` enum (LargestFirst, SmallestFirst,
-> BranchAndBound, Random, Optimal) anywhere in the codebase. The actual UTXO management is in
-> `via_verifier/lib/via_musig2/src/utxo_manager.rs` and uses a simple `UtxoManager` struct with
-> a single largest-first selection strategy (sort descending, accumulate until target).
-> See the wiki page `via-btc-sender-inscription-pipeline-and-utxo-management.md` for verified documentation.
+Via manages Bitcoin UTXOs in two independent places, and they solve different problems:
 
-## Overview
+1. **Bridge side** (`UtxoManager`, `via_verifier/lib/via_musig2/src/utxo_manager.rs`): selects and tracks the bridge address's UTXOs for MuSig2 withdrawal transactions.
+2. **Inscriber side** (`core/lib/via_btc_client/src/inscriber/mod.rs`): manages the sequencer/verifier wallet's P2WPKH UTXOs that fund commit/reveal inscription pairs.
 
-Via manages Bitcoin UTXOs for bridge withdrawal transactions. The implementation is simpler than this document originally described.
+> Historical note: an earlier auto-generated version of this document described a `UtxoSelector` with multiple selection strategies (LargestFirst, BranchAndBound, etc.), a `UtxoConsolidator`, a `FeeEstimator`, and a `via_utxo_management.toml` config. None of that exists in the codebase. Everything below is verified against source.
 
-## Actual Implementation: UtxoManager
-
-The real UTXO management struct is `UtxoManager` in `via_verifier/lib/via_musig2/src/utxo_manager.rs`:
+## Bridge side: `UtxoManager`
 
 ```rust
+// via_verifier/lib/via_musig2/src/utxo_manager.rs
+const DEFAULT_CAPACITY: usize = 100;
+
+#[derive(Debug, Clone)]
 pub struct UtxoManager {
+    /// Btc client
     btc_client: Arc<dyn BitcoinOps>,
-    context: Arc<RwLock<VecDeque<Transaction>>>,  // in-memory unconfirmed tx tracking
-    minimum_amount: Amount,                        // for UTXO consolidation
-    merge_limit: usize,                            // max UTXOs to merge at once
+    /// The transactions executed by the wallet
+    context: Arc<RwLock<VecDeque<Transaction>>>,
+    /// The minimum amount to merge utxos
+    minimum_amount: Amount,
+    /// The maximum number of utxos to merge in a single tx
+    merge_limit: usize,
 }
 ```
 
-### UTXO Selection
+The `context` deque is the key idea: it holds this wallet's **broadcast-but-unconfirmed transactions**, so UTXO selection can account for pending spends and pending change without waiting for confirmations.
 
-There is **one selection strategy**: sort all available UTXOs by value descending (largest first), then iterate and accumulate until the target amount is met:
+### Methods
+
+| Method | What it does |
+|--------|-------------|
+| `new(btc_client, minimum_amount, merge_limit)` | Construct with an empty in-memory context |
+| `get_available_utxos(address)` | Fetch confirmed UTXOs from the node, then replay the context: add pending change outputs paying `address`, remove UTXOs spent by pending txs. Result sorted by value descending |
+| `select_utxos_by_target_value(utxos, target)` | Walk the (already sorted, largest-first) list, accumulating until `total >= target`; errors on overflow or insufficient funds |
+| `get_utxos_to_merge(bridge_address)` | Collect up to `merge_limit` UTXOs whose value is at least `minimum_amount`; returns them only if more than one (consolidation candidates) |
+| `sync_context_with_blockchain()` | Pop confirmed transactions off the front of the context deque (stops at the first unconfirmed one) |
+| `insert_transaction(tx)` | Push a newly broadcast tx onto the context (deduplicated by txid) |
+| `get_btc_client()` | Access the underlying client |
+
+### The pending-transaction overlay: `get_available_utxos`
+
+```rust
+pub async fn get_available_utxos(
+    &self,
+    address: Address,
+) -> anyhow::Result<Vec<(OutPoint, TxOut)>> {
+    // fetch utxos from client
+    let mut utxos = self.btc_client.fetch_utxos(&address).await?;
+    let context = self.context.read().await;
+
+    {
+        if context.is_empty() {
+            // Sort UTXOs by value in descending order (big to small)
+            utxos.sort_by(|a, b| b.1.value.cmp(&a.1.value));
+            return Ok(utxos);
+        }
+    }
+
+    for tx in context.iter() {
+        // Add the output utxos to the list
+        for (i, out) in tx.output.iter().enumerate() {
+            if out.script_pubkey == address.script_pubkey() {
+                let outpoint = OutPoint {
+                    txid: tx.compute_txid(),
+                    vout: i as u32,
+                };
+                utxos.push((outpoint, out.clone()));
+            }
+        }
+
+        // Remove the inputs used utxos
+        for input in &tx.input {
+            if let Some(index) = utxos
+                .iter()
+                .position(|(op, _)| op == &input.previous_output)
+            {
+                utxos.remove(index);
+            }
+        }
+    }
+
+    // Sort UTXOs by value in descending order (big to small)
+    utxos.sort_by(|a, b| b.1.value.cmp(&a.1.value));
+
+    Ok(utxos)
+}
+```
+
+### Selection strategy
+
+There is exactly **one** selection strategy: largest-first accumulation. Sorting happens in `get_available_utxos()` (descending by value); `select_utxos_by_target_value()` just accumulates in order:
 
 ```rust
 pub async fn select_utxos_by_target_value(
@@ -34,647 +99,124 @@ pub async fn select_utxos_by_target_value(
     utxos: &[(OutPoint, TxOut)],
     target_amount: Amount,
 ) -> anyhow::Result<Vec<(OutPoint, TxOut)>> {
+    // Simple implementation - could be improved with better UTXO selection algorithm
     let mut selected = Vec::new();
     let mut total = Amount::ZERO;
+
     for utxo in utxos {
         selected.push(utxo.clone());
-        total = total.checked_add(utxo.1.value)
+        total = total
+            .checked_add(utxo.1.value)
             .ok_or_else(|| anyhow::anyhow!("Amount overflow during UTXO selection"))?;
-        if total >= target_amount { break; }
+
+        if total >= target_amount {
+            break;
+        }
     }
+
     if total < target_amount {
-        return Err(anyhow::anyhow!("Insufficient funds: have {}, need {}", total, target_amount));
+        return Err(anyhow::anyhow!(
+            "Insufficient funds: have {}, need {}",
+            total, target_amount
+        ));
     }
+
     Ok(selected)
 }
 ```
 
-### What follows below is the original auto-generated content (UNRELIABLE)
+### Consolidation
+
+Consolidation is not a background job with thresholds; it is just `get_utxos_to_merge()`, which the withdrawal flow can use to sweep up to `merge_limit` bridge UTXOs of at least `minimum_amount` into one transaction. With fewer than two candidates it returns nothing:
 
 ```rust
-impl UtxoSelector {
-    pub async fn select_utxos_for_amount(
-        &self,
-        target_amount: u64,
-        available_utxos: &[Utxo],
-        max_inputs: Option<usize>,
-    ) -> Result<UtxoSelection, UtxoSelectionError> {
-        match self.selection_strategy {
-            UtxoSelectionStrategy::LargestFirst => {
-                self.select_largest_first(target_amount, available_utxos, max_inputs).await
-            }
-            UtxoSelectionStrategy::SmallestFirst => {
-                self.select_smallest_first(target_amount, available_utxos, max_inputs).await
-            }
-            UtxoSelectionStrategy::BranchAndBound => {
-                self.select_branch_and_bound(target_amount, available_utxos, max_inputs).await
-            }
-            UtxoSelectionStrategy::Optimal => {
-                self.select_optimal(target_amount, available_utxos, max_inputs).await
-            }
-            UtxoSelectionStrategy::Random => {
-                self.select_random(target_amount, available_utxos, max_inputs).await
-            }
+pub async fn get_utxos_to_merge(
+    &self,
+    bridge_address: Address,
+) -> anyhow::Result<Vec<(OutPoint, TxOut)>> {
+    let mut utxos_to_merge = Vec::new();
+    let available_utxos = self.get_available_utxos(bridge_address).await?;
+
+    // If the amount is greater than the minimum amount to merge
+    for (outpoint, txout) in available_utxos.iter() {
+        if txout.value >= self.minimum_amount {
+            utxos_to_merge.push((*outpoint, txout.clone()));
+        }
+        if utxos_to_merge.len() == self.merge_limit {
+            break;
         }
     }
-    
-    async fn select_largest_first(
-        &self,
-        target_amount: u64,
-        available_utxos: &[Utxo],
-        max_inputs: Option<usize>,
-    ) -> Result<UtxoSelection, UtxoSelectionError> {
-        // Sort UTXOs by value in descending order for efficient selection
-        let mut sorted_utxos = available_utxos
-            .iter()
-            .filter(|utxo| utxo.value >= self.dust_threshold.to_sat())
-            .cloned()
-            .collect::<Vec<_>>();
-        
-        // Enhanced sorting: primary by value (descending), secondary by age (older first)
-        sorted_utxos.sort_by(|a, b| {
-            match b.value.cmp(&a.value) {
-                std::cmp::Ordering::Equal => a.block_height.cmp(&b.block_height),
-                other => other,
-            }
-        });
-        
-        let mut selected_utxos = Vec::new();
-        let mut selected_value = 0u64;
-        let max_inputs = max_inputs.unwrap_or(100); // Default max inputs
-        
-        for utxo in sorted_utxos {
-            if selected_utxos.len() >= max_inputs {
-                break;
-            }
-            
-            selected_utxos.push(utxo);
-            selected_value += utxo.value;
-            
-            // Check if we have enough value including estimated fees
-            let estimated_fee = self.estimate_transaction_fee(selected_utxos.len(), 2).await?;
-            if selected_value >= target_amount + estimated_fee {
-                break;
-            }
-        }
-        
-        let final_fee = self.estimate_transaction_fee(selected_utxos.len(), 2).await?;
-        let total_required = target_amount + final_fee;
-        
-        if selected_value < total_required {
-            return Err(UtxoSelectionError::InsufficientFunds {
-                required: total_required,
-                available: selected_value,
-            });
-        }
-        
-        Ok(UtxoSelection {
-            utxos: selected_utxos,
-            total_value: selected_value,
-            target_amount,
-            estimated_fee: final_fee,
-            change_amount: selected_value.saturating_sub(total_required),
-        })
+    if utxos_to_merge.len() > 1 {
+        return Ok(utxos_to_merge);
     }
+    Ok(vec![])
 }
 ```
 
-## UTXO Data Structures
-
-### UTXO Representation
+### Context maintenance
 
 ```rust
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Utxo {
-    pub txid: Txid,
-    pub vout: u32,
-    pub value: u64,
-    pub script_pubkey: ScriptBuf,
-    pub address: Option<Address>,
-    pub block_height: u32,
-    pub confirmations: u32,
-    pub spendable: bool,
-    pub solvable: bool,
-    pub safe: bool,
-    pub label: Option<String>,
-    pub witness_utxo: Option<TxOut>,
-}
-
-impl Utxo {
-    pub fn is_dust(&self, dust_threshold: Amount) -> bool {
-        self.value < dust_threshold.to_sat()
-    }
-    
-    pub fn is_mature(&self, current_height: u32, maturity_blocks: u32) -> bool {
-        current_height.saturating_sub(self.block_height) >= maturity_blocks
-    }
-    
-    pub fn effective_value(&self, fee_rate: u64) -> i64 {
-        let input_size = self.input_size();
-        let input_fee = (input_size as u64) * fee_rate;
-        (self.value as i64) - (input_fee as i64)
-    }
-    
-    fn input_size(&self) -> usize {
-        // Estimate input size based on script type
-        match self.script_pubkey.len() {
-            25 => 148, // P2PKH
-            23 => 148, // P2SH
-            22 => 68,  // P2WPKH
-            34 => 104, // P2WSH
-            _ => 148,  // Default to P2PKH size
-        }
-    }
-}
-```
-
-### UTXO Selection Result
-
-```rust
-#[derive(Debug, Clone)]
-pub struct UtxoSelection {
-    pub utxos: Vec<Utxo>,
-    pub total_value: u64,
-    pub target_amount: u64,
-    pub estimated_fee: u64,
-    pub change_amount: u64,
-}
-
-impl UtxoSelection {
-    pub fn input_count(&self) -> usize {
-        self.utxos.len()
-    }
-    
-    pub fn requires_change(&self) -> bool {
-        self.change_amount > 0
-    }
-    
-    pub fn efficiency_score(&self) -> f64 {
-        // Calculate efficiency as ratio of target amount to total input value
-        if self.total_value == 0 {
-            0.0
-        } else {
-            (self.target_amount as f64) / (self.total_value as f64)
-        }
-    }
-    
-    pub fn fee_rate(&self) -> f64 {
-        let estimated_tx_size = self.estimated_transaction_size();
-        if estimated_tx_size == 0 {
-            0.0
-        } else {
-            (self.estimated_fee as f64) / (estimated_tx_size as f64)
-        }
-    }
-    
-    fn estimated_transaction_size(&self) -> usize {
-        // Base transaction size + inputs + outputs
-        let base_size = 10; // Version (4) + input count (1) + output count (1) + locktime (4)
-        let input_size: usize = self.utxos.iter().map(|u| u.input_size()).sum();
-        let output_size = 34 * 2; // Assume 2 outputs (recipient + change)
-        base_size + input_size + output_size
-    }
-}
-```
-
-## Advanced Selection Strategies
-
-### Branch and Bound Algorithm
-
-Implements the Branch and Bound algorithm for optimal UTXO selection:
-
-```rust
-impl UtxoSelector {
-    async fn select_branch_and_bound(
-        &self,
-        target_amount: u64,
-        available_utxos: &[Utxo],
-        max_inputs: Option<usize>,
-    ) -> Result<UtxoSelection, UtxoSelectionError> {
-        let fee_rate = self.fee_estimator.get_fee_rate().await?;
-        let max_inputs = max_inputs.unwrap_or(100);
-        
-        // Calculate effective values for all UTXOs
-        let mut effective_utxos: Vec<(Utxo, i64)> = available_utxos
-            .iter()
-            .filter(|utxo| utxo.value >= self.dust_threshold.to_sat())
-            .map(|utxo| {
-                let effective_value = utxo.effective_value(fee_rate);
-                (utxo.clone(), effective_value)
-            })
-            .filter(|(_, effective_value)| *effective_value > 0)
-            .collect();
-        
-        // Sort by effective value descending
-        effective_utxos.sort_by(|a, b| b.1.cmp(&a.1));
-        
-        let target_effective = target_amount as i64;
-        let mut best_selection: Option<Vec<Utxo>> = None;
-        let mut best_waste = i64::MAX;
-        
-        // Branch and bound search
-        self.branch_and_bound_search(
-            &effective_utxos,
-            target_effective,
-            0,
-            0,
-            Vec::new(),
-            &mut best_selection,
-            &mut best_waste,
-            max_inputs,
-        );
-        
-        match best_selection {
-            Some(utxos) => {
-                let total_value = utxos.iter().map(|u| u.value).sum();
-                let estimated_fee = self.estimate_transaction_fee(utxos.len(), 2).await?;
-                let change_amount = total_value.saturating_sub(target_amount + estimated_fee);
-                
-                Ok(UtxoSelection {
-                    utxos,
-                    total_value,
-                    target_amount,
-                    estimated_fee,
-                    change_amount,
-                })
+pub async fn sync_context_with_blockchain(&self) -> anyhow::Result<()> {
+    loop {
+        let tx = {
+            match self.context.read().await.front() {
+                Some(tx) => tx.clone(),
+                None => break,
             }
-            None => Err(UtxoSelectionError::NoSolutionFound),
-        }
-    }
-    
-    fn branch_and_bound_search(
-        &self,
-        utxos: &[(Utxo, i64)],
-        target: i64,
-        current_index: usize,
-        current_value: i64,
-        current_selection: Vec<Utxo>,
-        best_selection: &mut Option<Vec<Utxo>>,
-        best_waste: &mut i64,
-        max_inputs: usize,
-    ) {
-        // Pruning conditions
-        if current_selection.len() > max_inputs {
-            return;
-        }
-        
-        if current_value >= target {
-            let waste = current_value - target;
-            if waste < *best_waste {
-                *best_waste = waste;
-                *best_selection = Some(current_selection);
-            }
-            return;
-        }
-        
-        if current_index >= utxos.len() {
-            return;
-        }
-        
-        // Upper bound check
-        let remaining_value: i64 = utxos[current_index..].iter().map(|(_, v)| v).sum();
-        if current_value + remaining_value < target {
-            return;
-        }
-        
-        // Try including current UTXO
-        let mut new_selection = current_selection.clone();
-        new_selection.push(utxos[current_index].0.clone());
-        self.branch_and_bound_search(
-            utxos,
-            target,
-            current_index + 1,
-            current_value + utxos[current_index].1,
-            new_selection,
-            best_selection,
-            best_waste,
-            max_inputs,
-        );
-        
-        // Try excluding current UTXO
-        self.branch_and_bound_search(
-            utxos,
-            target,
-            current_index + 1,
-            current_value,
-            current_selection,
-            best_selection,
-            best_waste,
-            max_inputs,
-        );
-    }
-}
-```
-
-## UTXO Consolidation
-
-### Consolidation Strategy
-
-The system implements intelligent UTXO consolidation to reduce fragmentation:
-
-```rust
-pub struct UtxoConsolidator {
-    dust_threshold: Amount,
-    consolidation_threshold: usize,
-    max_consolidation_inputs: usize,
-    fee_estimator: Arc<FeeEstimator>,
-}
-
-impl UtxoConsolidator {
-    pub async fn should_consolidate(&self, utxos: &[Utxo]) -> bool {
-        let small_utxos = utxos
-            .iter()
-            .filter(|u| u.value < self.dust_threshold.to_sat() * 10)
-            .count();
-        
-        small_utxos >= self.consolidation_threshold
-    }
-    
-    pub async fn create_consolidation_transaction(
-        &self,
-        utxos: &[Utxo],
-        destination_address: &Address,
-    ) -> Result<ConsolidationTransaction, ConsolidationError> {
-        // Select UTXOs for consolidation (prioritize smallest first)
-        let mut consolidation_utxos = utxos
-            .iter()
-            .filter(|u| u.value >= self.dust_threshold.to_sat())
-            .cloned()
-            .collect::<Vec<_>>();
-        
-        // Sort by value ascending (smallest first for consolidation)
-        consolidation_utxos.sort_by(|a, b| a.value.cmp(&b.value));
-        
-        // Limit number of inputs
-        consolidation_utxos.truncate(self.max_consolidation_inputs);
-        
-        let total_input_value: u64 = consolidation_utxos.iter().map(|u| u.value).sum();
-        let estimated_fee = self.estimate_consolidation_fee(consolidation_utxos.len()).await?;
-        
-        if total_input_value <= estimated_fee {
-            return Err(ConsolidationError::InsufficientValue);
-        }
-        
-        let output_value = total_input_value - estimated_fee;
-        
-        Ok(ConsolidationTransaction {
-            inputs: consolidation_utxos,
-            output_value,
-            destination_address: destination_address.clone(),
-            estimated_fee,
-        })
-    }
-    
-    async fn estimate_consolidation_fee(&self, input_count: usize) -> Result<u64, FeeEstimationError> {
-        let fee_rate = self.fee_estimator.get_fee_rate().await?;
-        
-        // Estimate transaction size: inputs (148 bytes each) + 1 output (34 bytes) + overhead (10 bytes)
-        let estimated_size = (input_count * 148) + 34 + 10;
-        Ok((estimated_size as u64) * fee_rate)
-    }
-}
-```
-
-## Fee Estimation
-
-### Dynamic Fee Estimation
-
-The system implements dynamic fee estimation based on network conditions:
-
-```rust
-pub struct FeeEstimator {
-    btc_client: Arc<BitcoinClient>,
-    fee_cache: Arc<RwLock<FeeCache>>,
-    network: Network,
-}
-
-impl FeeEstimator {
-    pub async fn get_fee_rate(&self) -> Result<u64, FeeEstimationError> {
-        // Check cache first
-        if let Some(cached_rate) = self.get_cached_fee_rate().await {
-            return Ok(cached_rate);
-        }
-        
-        // Fetch from Bitcoin node
-        let fee_rate = match self.network {
-            Network::Bitcoin => self.estimate_mainnet_fee().await?,
-            Network::Testnet => self.estimate_testnet_fee().await?,
-            Network::Regtest => self.get_regtest_fee().await?,
-            _ => return Err(FeeEstimationError::UnsupportedNetwork),
         };
-        
-        // Cache the result
-        self.cache_fee_rate(fee_rate).await;
-        
-        Ok(fee_rate)
-    }
-    
-    async fn estimate_mainnet_fee(&self) -> Result<u64, FeeEstimationError> {
-        // Use estimatesmartfee for mainnet
-        let estimate = self.btc_client.estimate_smart_fee(6).await?; // 6 blocks target
-        let fee_rate = (estimate.fee_rate * 100_000_000.0) as u64; // Convert BTC/kB to sat/byte
-        
-        // Apply network-specific limits
-        let min_fee = 1; // 1 sat/byte minimum
-        let max_fee = 1000; // 1000 sat/byte maximum
-        
-        Ok(fee_rate.clamp(min_fee, max_fee))
-    }
-    
-    async fn estimate_testnet_fee(&self) -> Result<u64, FeeEstimationError> {
-        // More conservative for testnet
-        let estimate = self.btc_client.estimate_smart_fee(3).await?;
-        let fee_rate = (estimate.fee_rate * 100_000_000.0) as u64;
-        
-        let min_fee = 1;
-        let max_fee = 100; // Lower max for testnet
-        
-        Ok(fee_rate.clamp(min_fee, max_fee))
-    }
-    
-    async fn get_regtest_fee(&self) -> Result<u64, FeeEstimationError> {
-        // Fixed low fee for regtest
-        Ok(1) // 1 sat/byte
-    }
-    
-    pub async fn estimate_transaction_fee(
-        &self,
-        input_count: usize,
-        output_count: usize,
-    ) -> Result<u64, FeeEstimationError> {
-        let fee_rate = self.get_fee_rate().await?;
-        
-        // Calculate transaction size
-        let base_size = 10; // Version + input count + output count + locktime
-        let input_size = input_count * 148; // Average input size
-        let output_size = output_count * 34; // Average output size
-        let total_size = base_size + input_size + output_size;
-        
-        Ok((total_size as u64) * fee_rate)
-    }
-}
-```
 
-## UTXO Monitoring and Maintenance
+        let txid = tx.compute_txid();
+        let is_confirmed = self
+            .btc_client
+            .check_tx_confirmation(&txid, CTX_REQUIRED_CONFIRMATIONS)
+            .await?;
 
-### UTXO Set Management
-
-```rust
-pub struct UtxoManager {
-    btc_client: Arc<BitcoinClient>,
-    database: Arc<Database>,
-    consolidator: UtxoConsolidator,
-    selector: UtxoSelector,
-}
-
-impl UtxoManager {
-    pub async fn refresh_utxo_set(&mut self) -> Result<(), UtxoManagerError> {
-        // Fetch current UTXOs from Bitcoin node
-        let current_utxos = self.btc_client.list_unspent(None, None, None).await?;
-        
-        // Update database with current UTXO set
-        self.database.update_utxo_set(&current_utxos).await?;
-        
-        // Check if consolidation is needed
-        if self.consolidator.should_consolidate(&current_utxos).await {
-            tracing::info!("UTXO consolidation recommended: {} small UTXOs detected", 
-                          current_utxos.len());
+        if is_confirmed {
+            self.context.write().await.pop_front();
+        } else {
+            break;
         }
-        
-        Ok(())
     }
-    
-    pub async fn get_optimal_utxos_for_amount(
-        &self,
-        amount: u64,
-        max_inputs: Option<usize>,
-    ) -> Result<UtxoSelection, UtxoManagerError> {
-        let available_utxos = self.database.get_spendable_utxos().await?;
-        
-        self.selector
-            .select_utxos_for_amount(amount, &available_utxos, max_inputs)
-            .await
-            .map_err(UtxoManagerError::SelectionError)
-    }
-    
-    pub async fn mark_utxos_as_spent(
-        &self,
-        utxos: &[Utxo],
-        spending_txid: Txid,
-    ) -> Result<(), UtxoManagerError> {
-        self.database.mark_utxos_spent(utxos, spending_txid).await?;
-        Ok(())
-    }
-    
-    pub async fn get_utxo_statistics(&self) -> Result<UtxoStatistics, UtxoManagerError> {
-        let utxos = self.database.get_all_utxos().await?;
-        
-        let total_count = utxos.len();
-        let total_value: u64 = utxos.iter().map(|u| u.value).sum();
-        let dust_count = utxos.iter().filter(|u| u.is_dust(Amount::from_sat(546))).count();
-        let average_value = if total_count > 0 { total_value / (total_count as u64) } else { 0 };
-        
-        // Calculate value distribution
-        let mut value_buckets = [0usize; 10];
-        for utxo in &utxos {
-            let bucket_index = match utxo.value {
-                0..=1000 => 0,
-                1001..=10000 => 1,
-                10001..=100000 => 2,
-                100001..=1000000 => 3,
-                1000001..=10000000 => 4,
-                10000001..=100000000 => 5,
-                100000001..=1000000000 => 6,
-                1000000001..=10000000000 => 7,
-                10000000001..=100000000000 => 8,
-                _ => 9,
-            };
-            value_buckets[bucket_index] += 1;
+    Ok(())
+}
+
+pub async fn insert_transaction(&self, tx: Transaction) {
+    for ctx_tx in self.context.read().await.iter() {
+        if ctx_tx.compute_txid() == tx.compute_txid() {
+            return;
         }
-        
-        Ok(UtxoStatistics {
-            total_count,
-            total_value,
-            dust_count,
-            average_value,
-            value_distribution: value_buckets,
-        })
     }
+    self.context.write().await.push_back(tx);
 }
 ```
 
-## Configuration and Tuning
+Note the deque discipline in `sync_context_with_blockchain`: it only ever pops from the **front** and stops at the first unconfirmed transaction. Because pending transactions can chain (a later tx spends an earlier tx's change), confirming them out of order is not meaningful; the FIFO order mirrors the dependency order.
 
-### UTXO Management Configuration
+### Chained spending safety
 
-```toml
-# etc/env/base/via_utxo_management.toml
+The withdrawal `TransactionBuilder` uses `UtxoManager` like this:
 
-[utxo_selection]
-strategy = "largest_first"  # largest_first, smallest_first, branch_and_bound, optimal
-dust_threshold = 546        # satoshis
-max_inputs_per_tx = 100
-selection_timeout = 30      # seconds
+1. `sync_context_with_blockchain()` to drop confirmed txs from the context
+2. `get_available_utxos(bridge_address)` for the effective spendable set (confirmed + pending change, minus pending spends)
+3. `select_utxos_by_target_value(...)` for the outputs plus fee
+4. After building, `insert_transaction(unsigned_tx)` so the next session sees this spend as pending
 
-[consolidation]
-enabled = true
-threshold = 50              # consolidate when more than 50 small UTXOs
-max_inputs = 200           # maximum inputs in consolidation tx
-small_utxo_multiplier = 10 # UTXOs smaller than dust_threshold * multiplier
+This is what lets multiple withdrawal transactions chain safely before earlier ones confirm, without double-spending bridge UTXOs.
 
-[fee_estimation]
-cache_duration = 300       # seconds
-mainnet_max_fee_rate = 1000 # sat/byte
-testnet_max_fee_rate = 100  # sat/byte
-regtest_fee_rate = 1        # sat/byte
-confirmation_target = 6     # blocks
+## Inscriber side: wallet UTXOs for inscriptions
 
-[monitoring]
-refresh_interval = 60      # seconds
-statistics_interval = 300  # seconds
-alert_dust_threshold = 100 # alert when more than 100 dust UTXOs
-```
+The Inscriber (`core/lib/via_btc_client/src/inscriber/mod.rs`) manages the operator wallet's P2WPKH UTXOs that pay for commit/reveal pairs:
 
-### Environment Variables
+- `sync_context_with_blockchain()` refreshes the wallet's UTXO view before building; the caller is expected to invoke it before each inscription
+- `prepare_commit_tx_input()` selects wallet UTXOs, and when earlier inscriptions are still in flight it spends the **newest pending reveal transaction's change output**, forming a FIFO chain of unconfirmed inscription transactions
+- Fee handling shifts 20% of the estimated commit fee onto the reveal transaction and adds incentives (see the fee constants in `inscriber/fee.rs`)
 
-```bash
-# UTXO Selection Configuration
-export VIA_UTXO_SELECTION_STRATEGY="largest_first"
-export VIA_UTXO_DUST_THRESHOLD=546
-export VIA_UTXO_MAX_INPUTS=100
+So both sides use the same pattern: an in-memory view of pending transactions layered over the node's confirmed UTXO set, enabling safe chaining of unconfirmed spends.
 
-# Consolidation Configuration
-export VIA_UTXO_CONSOLIDATION_ENABLED=true
-export VIA_UTXO_CONSOLIDATION_THRESHOLD=50
-export VIA_UTXO_CONSOLIDATION_MAX_INPUTS=200
+## Monitoring notes
 
-# Fee Estimation Configuration
-export VIA_FEE_CACHE_DURATION=300
-export VIA_MAINNET_MAX_FEE_RATE=1000
-export VIA_TESTNET_MAX_FEE_RATE=100
-export VIA_REGTEST_FEE_RATE=1
-```
+Useful signals when operating either side:
 
-## Performance Optimization
-
-### Optimization Strategies
-
-1. **UTXO Caching**: Cache UTXO sets to reduce Bitcoin node queries
-2. **Parallel Processing**: Process UTXO operations in parallel where possible
-3. **Database Indexing**: Optimize database queries with proper indexing
-4. **Fee Rate Caching**: Cache fee rate estimates to reduce API calls
-5. **Batch Operations**: Batch UTXO updates and database operations
-
-### Monitoring and Metrics
-
-Key metrics to monitor for UTXO management:
-
-- **UTXO Set Size**: Total number of UTXOs
-- **UTXO Value Distribution**: Distribution of UTXO values
-- **Dust UTXO Count**: Number of dust UTXOs
-- **Selection Efficiency**: Average efficiency of UTXO selections
-- **Consolidation Frequency**: How often consolidation is performed
-- **Fee Rate Accuracy**: Accuracy of fee rate estimates
-- **Selection Time**: Time taken for UTXO selection operations
-
-This comprehensive UTXO management system ensures efficient Bitcoin transaction construction while minimizing fees and maintaining optimal UTXO set health.
+- Growth of the pending context (bridge) or in-flight inscription queue (sequencer) indicates confirmation lag
+- `Insufficient funds` errors from `select_utxos_by_target_value` mean the bridge balance minus pending spends cannot cover the withdrawal set
+- Consolidation frequency is governed by `minimum_amount` and `merge_limit` passed to `UtxoManager::new`

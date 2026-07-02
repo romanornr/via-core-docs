@@ -31,41 +31,33 @@ The Verifier Network follows a hub-and-spoke architecture with a designated Coor
 
 ### 2.2 Configuration and Deployment
 
-The Verifier Network is configured through environment variables, with each node having a specific role defined by the `VerifierMode` configuration parameter:
+The Verifier Network is configured through environment variables, with each node's role defined by `ViaNodeRole` (the old `VerifierMode` enum was replaced):
 
 ```rust
 // via_verifier/bin/verifier_server/src/node_builder.rs
-pub fn new(via_general_config: ViaGeneralConfig, secrets: Secrets) -> anyhow::Result<Self> {
-    let via_verifier_config = try_load_config!(via_general_config.via_verifier_config);
-    let is_coordinator = via_verifier_config.verifier_mode == VerifierMode::COORDINATOR;
-    // ...
-}
+is_coordinator: configs.via_verifier_config.role == ViaNodeRole::Coordinator,
 ```
 
-The Verifier node is built with different layers depending on its role:
+The Verifier node is assembled from layers; the coordinator additionally gets the REST API layer. The current layer set (`node_builder.rs`) includes:
 
-```rust
-// via_verifier/bin/verifier_server/src/node_builder.rs
-pub fn build(mut self) -> anyhow::Result<ZkStackService> {
-    self = self
-        .add_sigint_handler_layer()?
-        .add_healthcheck_layer()?
-        .add_circuit_breaker_checker_layer()?
-        .add_pools_layer()?
-        .add_btc_sender_layer()?
-        .add_verifier_btc_watcher_layer()?
-        .add_via_celestia_da_client_layer()?
-        .add_zkp_verification_layer()?;
-
-    if self.is_coordinator {
-        self = self.add_verifier_coordinator_api_layer()?
-    }
-
-    self = self.add_withdrawal_verifier_task_layer()?;
-
-    Ok(self.node.build())
-}
 ```
+add_sigint_handler_layer
+add_healthcheck_layer
+add_circuit_breaker_checker_layer
+add_prometheus_exporter_layer
+add_pools_layer
+add_btc_client_layer
+add_via_da_client_layer
+add_btc_sender_layer
+add_btc_watcher_layer
+add_zkp_verification_layer
+add_verifier_coordinator_api_layer   (coordinator only)
+add_withdrawal_verifier_task_layer
+add_block_reverter_layer
+add_storage_initialization_layer
+```
+
+The block reverter layer is worth noting: verifier nodes can automatically roll back their state after a hard Bitcoin reorg (see `via_verifier/node/via_block_reverter/`).
 
 ## 3. Participant Roles and Responsibilities
 
@@ -83,36 +75,50 @@ Implementation:
 ```rust
 // via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs
 pub struct ViaWithdrawalVerifier {
+    verifier_config: ViaVerifierConfig,
+    wallet: ViaWallet,
     session_manager: SessionManager,
     btc_client: Arc<dyn BitcoinOps>,
-    config: ViaVerifierConfig,
+    master_connection_pool: ConnectionPool<Verifier>,
     client: Client,
-    signer: Signer,
-    final_sig: Option<CompactSignature>,
+    signer_per_utxo_input: BTreeMap<usize, Signer>,
+    final_sig_per_utxo_input: BTreeMap<usize, CompactSignature>,
+    // ...
 }
 ```
 
-The Verifier node periodically polls the Coordinator for new signing sessions:
+Signing state is kept **per UTXO input**: each input of the bridge transaction has its own `Signer` (its own MuSig2 nonce/partial-signature rounds) and its own aggregated `CompactSignature`, because Taproot key-path spends sign a distinct sighash per input.
+
+The Verifier node periodically polls the Coordinator for new signing sessions. The current loop gates on reorg/sync state and re-validates the verifier set before touching a session:
 
 ```rust
 // via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs
 async fn loop_iteration(&mut self) -> Result<(), anyhow::Error> {
-    let mut session_info = self.get_session().await?;
-    
-    // ... process session ...
-    
-    if session_info.received_nonces < session_info.required_signers {
-        if !session_nonces.contains_key(&verifier_index) {
-            self.submit_nonce().await?;
-        }
-    } else if session_info.received_nonces >= session_info.required_signers {
-        if self.signer.has_created_partial_sig() {
-            return Ok(());
-        }
-        self.submit_partial_signature(session_nonces).await?;
+    self.session_manager.prepare_session().await?;
+
+    if self.state.is_reorg_in_progress().await? {
+        return Ok(());
     }
-    
-    Ok(())
+
+    if self.state.is_sync_in_progress().await? {
+        return Ok(());
+    }
+
+    self.validate_verifier_addresses().await?;
+
+    let mut session_info = self.get_session().await?;
+
+    if self.is_coordinator() {
+        self.create_new_session().await?;
+        session_info = self.get_session().await?;
+        // ... skip empty or already-processed sessions ...
+    }
+
+    if session_info.session_op.is_empty() {
+        return Ok(());
+    }
+    let session_op = SessionOperation::from_bytes(&session_info.session_op);
+    // ... per-input nonce submission, partial signature submission, final broadcast ...
 }
 ```
 
@@ -204,15 +210,15 @@ All Verifier nodes independently monitor the Bitcoin blockchain for relevant ins
 ```rust
 // via_verifier/node/via_btc_watch/src/lib.rs
 pub struct VerifierBtcWatch {
+    config: ViaBtcWatchConfig,
     indexer: BitcoinInscriptionIndexer,
-    poll_interval: Duration,
-    confirmations_for_btc_msg: u64,
-    last_processed_bitcoin_block: u32,
     pool: ConnectionPool<Verifier>,
+    system_wallet_processor: Box<dyn MessageProcessor>,
     message_processors: Vec<Box<dyn MessageProcessor>>,
-    btc_blocks_lag: u32,
 }
 ```
+
+Polling interval and confirmation depth now live in `ViaBtcWatchConfig`, and the last-processed block is persisted in the database (`via_indexer_dal().get_last_processed_l1_block(...)`) instead of held in memory. A dedicated `system_wallet_processor` runs before the regular processors to apply governance-driven wallet rotations.
 
 The `VerifierMessageProcessor` handles two types of messages:
 
@@ -313,7 +319,7 @@ pub fn start_signing_session(&mut self, message: Vec<u8>) -> Result<PubNonce, Mu
 
     let first_round = FirstRound::new(
         self.key_agg_ctx.clone(),
-        rand::random::<[u8; 32]>(),
+        OsRng.gen::<[u8; 32]>(),
         self.signer_index,
         SecNonceSpices::new()
             .with_seckey(self.secret_key)
@@ -379,68 +385,76 @@ The withdrawal processing flow involves multiple components working together:
 ```rust
 // via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs
 async fn session(&self) -> anyhow::Result<Option<SessionOperation>> {
-    // Get the l1 batches finilized but withdrawals not yet processed
-    let l1_batches = self
+    let mut storage = self
         .master_connection_pool
-        .connection_tagged("withdrawal session")
-        .await?
-        .via_votes_dal()
-        .list_finalized_blocks_and_non_processed_withdrawals()
+        .connection_tagged("verifier task")
         .await?;
 
-    if l1_batches.is_empty() {
+    // Set the minimum amount to withdraw + fee = 660 sats.
+    let min_value = 660;
+
+    let no_processed_withdrawals = storage
+        .via_withdrawal_dal()
+        .list_no_processed_withdrawals(min_value, WITHDRAWAL_LIMIT)
+        .await?;
+
+    if no_processed_withdrawals.is_empty() {
         return Ok(None);
     }
 
-    // ... process withdrawals ...
+    let mut outputs = vec![];
+    for w in no_processed_withdrawals {
+        let mut op_return_data = Vec::new();
+        op_return_data.extend_from_slice(&hex::decode(w.id)?);
+
+        outputs.push(TransactionOutput {
+            output: TxOut {
+                value: w.amount,
+                script_pubkey: w.receiver.script_pubkey(),
+            },
+            op_return_data: Some(op_return_data),
+        });
+    }
+
+    let mut op_return_prefix = Vec::new();
+    op_return_prefix.extend_from_slice(OP_RETURN_WITHDRAW_PREFIX);
+    op_return_prefix.push(WITHDRAWAL_VERSION as u8);
+
+    let config = TransactionBuilderConfig {
+        fee_strategy: Arc::new(WithdrawalFeeStrategy::new()),
+        max_tx_weight: MAX_STANDARD_TX_WEIGHT as u64,
+        max_output_per_tx: WITHDRAWAL_LIMIT as usize,
+        op_return_prefix,
+        bridge_address: self.get_system_wallets().await?.bridge,
+        default_fee_rate_opt: None,
+        default_available_utxos_opt: None,
+        op_return_data_input_opt: None,
+    };
+
+    let unsigned_txs = self
+        .transaction_builder
+        .build_transaction_with_op_return(outputs, config)
+        .await?;
+
+    if unsigned_txs.is_empty() {
+        return Ok(None);
+    }
+
+    let sig_hashes = self
+        .transaction_builder
+        .get_tr_sighashes(&unsigned_txs[0])?;
 
     Ok(Some(SessionOperation::Withdrawal(
-        l1_batch_number,
-        unsigned_tx,
-        sighash.to_byte_array().to_vec(),
-        raw_proof_tx_id,
+        unsigned_txs[0].clone(),
+        sig_hashes,
     )))
 }
 ```
 
 2. **Transaction Building**:
-   - The Coordinator builds an unsigned transaction for the withdrawals
-
-```rust
-// via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs
-pub async fn create_unsigned_tx(
-    &self,
-    withdrawals: Vec<WithdrawalRequest>,
-    proof_txid: Txid,
-) -> anyhow::Result<UnsignedBridgeTx> {
-    // Group withdrawals by address and sum amounts
-    let mut grouped_withdrawals: HashMap<Address, Amount> = HashMap::new();
-    for w in withdrawals {
-        *grouped_withdrawals.entry(w.address).or_insert(Amount::ZERO) = grouped_withdrawals
-            .get(&w.address)
-            .unwrap_or(&Amount::ZERO)
-            .checked_add(w.amount)
-            .ok_or_else(|| anyhow::anyhow!("Withdrawal amount overflow when grouping"))?;
-    }
-
-    // Create outputs for grouped withdrawals
-    let outputs: Vec<TxOut> = grouped_withdrawals
-        .into_iter()
-        .map(|(address, amount)| TxOut {
-            value: amount,
-            script_pubkey: address.script_pubkey(),
-        })
-        .collect();
-
-    self.transaction_builder
-        .build_transaction_with_op_return(
-            outputs,
-            OP_RETURN_WITHDRAW_PREFIX,
-            vec![proof_txid.as_raw_hash().to_byte_array()],
-        )
-        .await
-}
-```
+   - Withdrawals are read from the withdrawal DAL (minimum 660 sats each, up to `WITHDRAWAL_LIMIT` per session), each carrying its withdrawal id as per-output OP_RETURN data
+   - The `TransactionBuilder` splits the set into multiple transactions when weight (`MAX_STANDARD_TX_WEIGHT`) or output-count limits are hit; the session processes one transaction at a time
+   - The session payload contains one sighash per input (`get_tr_sighashes`); see `musig2_implementation.md` for the builder internals
 
 3. **MuSig2 Signing Process**:
    - Verifiers participate in the MuSig2 protocol to sign the transaction
@@ -458,39 +472,40 @@ async fn build_and_broadcast_final_transaction(
     session_info: &SigningSessionResponse,
     session_op: &SessionOperation,
 ) -> anyhow::Result<bool> {
-    if session_info.received_partial_signatures < session_info.required_signers {
+    let input_index = 0;
+    let received_partial_signatures = session_info
+        .received_partial_signatures
+        .get(&input_index)
+        .map_or(0, |len| *len);
+
+    if received_partial_signatures < session_info.required_signers {
         return Ok(false);
     }
 
-    if let Some((unsigned_tx, message)) = session_op.session() {
-        self.create_final_signature(message)
-            .await
-            .map_err(|e| anyhow::format_err!("Error create final signature: {e}"))?;
+    let unsigned_tx = session_op.get_unsigned_bridge_tx();
+    let messages = session_op.get_message_to_sign();
 
-        if let Some(musig2_signature) = self.final_sig {
-            // ... verify and prepare transaction ...
+    self.create_final_signature(&messages)
+        .await
+        .map_err(|e| anyhow::format_err!("Error create final signature: {e}"))?;
 
-            let signed_tx = self.sign_transaction(unsigned_tx.clone(), musig2_signature);
-
-            let txid = self
-                .btc_client
-                .broadcast_signed_transaction(&signed_tx)
-                .await?;
-
-            tracing::info!(
-                "Brodcast {} signed transaction with txid {}",
-                &session_op.get_session_type(),
-                &txid.to_string()
-            );
-
-            // ... update state ...
-
-            return Ok(true);
+    if !self.final_sig_per_utxo_input.is_empty() {
+        if !self
+            .session_manager
+            .before_broadcast_final_transaction(session_op)
+            .await?
+        {
+            return Ok(false);
         }
+
+        let signed_tx = self.sign_transaction(unsigned_tx.clone());
+        // ... broadcast_signed_transaction, after_broadcast_final_transaction ...
     }
-    Ok(false)
+    // ...
 }
 ```
+
+Aggregation produces one `CompactSignature` per input (`final_sig_per_utxo_input`); `sign_transaction` attaches each input's signature to its witness before broadcast. The session hooks (`before_process_session`, `before_broadcast_final_transaction`, `after_broadcast_final_transaction`) guard against double-processing across restarts.
 
 ## 7. Interactions with L1 (Bitcoin) and Data Availability (Celestia)
 
@@ -511,30 +526,31 @@ async fn loop_iteration(
     &mut self,
     storage: &mut Connection<'_, Verifier>,
 ) -> Result<(), MessageProcessorError> {
-    let to_block = self
-        .indexer
-        .fetch_block_height()
-        .await
-        .map_err(|e| MessageProcessorError::Internal(anyhow::anyhow!(e.to_string())))?
-        .saturating_sub(self.confirmations_for_btc_msg) as u32;
-
-    let messages = self
-        .indexer
-        .process_blocks(self.last_processed_bitcoin_block + 1, to_block)
-        .await
-        .map_err(|e| MessageProcessorError::Internal(e.into()))?;
-
-    for processor in self.message_processors.iter_mut() {
-        processor
-            .process_messages(storage, messages.clone(), &mut self.indexer)
-            .await
-            .map_err(|e| MessageProcessorError::Internal(e.into()))?;
+    if storage
+        .via_l1_block_dal()
+        .has_reorg_in_progress()
+        .await?
+        .is_some()
+    {
+        return Ok(());
     }
-    
-    self.last_processed_bitcoin_block = to_block;
-    Ok(())
+
+    let last_processed_bitcoin_block = storage
+        .via_indexer_dal()
+        .get_last_processed_l1_block(VerifierBtcWatch::module_name())
+        .await? as u32;
+
+    if last_processed_bitcoin_block == 0 {
+        return Err(MessageProcessorError::Internal(anyhow::anyhow!(
+            "The indexer was not initialized".to_string()
+        )));
+    }
+    // ... fetch protocol version, process blocks through system_wallet_processor
+    //     and message_processors, persist the new last-processed block ...
 }
 ```
+
+Two changes from earlier revisions: the loop pauses entirely while a reorg marker is present (`via_l1_block_dal().has_reorg_in_progress()`), and indexer progress is persisted in the database per module rather than held in memory, so a restarted verifier resumes exactly where it left off.
 
 3. **Broadcasting Withdrawals**:
    - Sending signed withdrawal transactions to the Bitcoin network
@@ -577,11 +593,7 @@ async fn process_batch_da_reference(
 
 ```rust
 // via_verifier/bin/verifier_server/src/node_builder.rs
-pub fn new(via_general_config: ViaGeneralConfig, secrets: Secrets) -> anyhow::Result<Self> {
-    let via_verifier_config = try_load_config!(via_general_config.via_verifier_config);
-    let is_coordinator = via_verifier_config.verifier_mode == VerifierMode::COORDINATOR;
-    // ...
-}
+is_coordinator: configs.via_verifier_config.role == ViaNodeRole::Coordinator,
 ```
 
 2. **N-of-N Signature Scheme**:
@@ -593,17 +605,20 @@ pub fn new(via_general_config: ViaGeneralConfig, secrets: Secrets) -> anyhow::Re
    - Verifier public keys are configured statically
 
 ```rust
-// via_verifier/node/via_verifier_coordinator/src/coordinator/api_decl.rs
-let state = ViaWithdrawalState {
-    signing_session: Arc::new(RwLock::new(SigningSession::default())),
-    required_signers: config.required_signers,
-    verifiers_pub_keys: config
-        .verifiers_pub_keys_str
-        .iter()
-        .map(|s| bitcoin::secp256k1::PublicKey::from_str(s).unwrap())
-        .collect(),
-    verifier_request_timeout: config.verifier_request_timeout,
-};
+// via_verifier/node/via_verifier_coordinator/src/types.rs
+pub struct ViaWithdrawalState {
+    pub signing_session: Arc<RwLock<SigningSession>>,
+    pub verifiers_pub_keys: Vec<bitcoin::secp256k1::PublicKey>,
+    pub verifier_request_timeout: u8,
+    pub session_timeout: u64,
+}
+```
+
+`required_signers` is no longer a config field; the coordinator derives it from the verifier set, hardcoding n-of-n:
+
+```rust
+// via_verifier/node/via_verifier_coordinator/src/coordinator/api_impl.rs
+required_signers: self_.state.verifiers_pub_keys.len(),
 ```
 
 ### 8.2 Future Improvements

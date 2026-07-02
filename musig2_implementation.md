@@ -34,12 +34,21 @@ Via L2 implements a custom wrapper library (`via_musig2`) that encapsulates the 
 via_verifier/lib/via_musig2/
 ├── Cargo.toml
 ├── examples/
+│   ├── compute_musig2.rs
 │   ├── coordinator.rs
 │   ├── key_generation_setup.rs
+│   ├── musig2_with_script_path.rs
+│   ├── transfer_utxos_from_bridge.rs
+│   ├── verify_partial_sig.rs
 │   └── withdrawal.rs
 └── src/
+    ├── constants.rs
+    ├── fee.rs
     ├── lib.rs
+    ├── test/
     ├── transaction_builder.rs
+    ├── types.rs
+    ├── utils.rs
     └── utxo_manager.rs
 ```
 
@@ -49,78 +58,84 @@ via_verifier/lib/via_musig2/
 
 MuSig2 is primarily used for signing withdrawal transactions that transfer funds from the Via L2 system back to the Bitcoin network. This process requires multiple Verifier nodes to collectively sign a Bitcoin transaction.
 
+The coordinator's withdrawal session pulls unprocessed withdrawals straight from the withdrawal DAL, attaches each withdrawal's id as per-output OP_RETURN data, and hands everything to the `TransactionBuilder` through a `TransactionBuilderConfig`:
+
 ```rust
 // via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs
-pub async fn create_unsigned_tx(
-    &self,
-    withdrawals: Vec<WithdrawalRequest>,
-    proof_txid: Txid,
-) -> anyhow::Result<UnsignedBridgeTx> {
-    // Group withdrawals by address and sum amounts
-    let mut grouped_withdrawals: HashMap<Address, Amount> = HashMap::new();
-    for w in withdrawals {
-        *grouped_withdrawals.entry(w.address).or_insert(Amount::ZERO) = grouped_withdrawals
-            .get(&w.address)
-            .unwrap_or(&Amount::ZERO)
-            .checked_add(w.amount)
-            .ok_or_else(|| anyhow::anyhow!("Withdrawal amount overflow when grouping"))?;
+async fn session(&self) -> anyhow::Result<Option<SessionOperation>> {
+    let mut storage = self
+        .master_connection_pool
+        .connection_tagged("verifier task")
+        .await?;
+
+    // Set the minimum amount to withdraw + fee = 660 sats.
+    let min_value = 660;
+
+    let no_processed_withdrawals = storage
+        .via_withdrawal_dal()
+        .list_no_processed_withdrawals(min_value, WITHDRAWAL_LIMIT)
+        .await?;
+
+    if no_processed_withdrawals.is_empty() {
+        return Ok(None);
     }
 
-    // Create outputs for grouped withdrawals
-    let outputs: Vec<TxOut> = grouped_withdrawals
-        .into_iter()
-        .map(|(address, amount)| TxOut {
-            value: amount,
-            script_pubkey: address.script_pubkey(),
-        })
-        .collect();
+    let mut outputs = vec![];
+    for w in no_processed_withdrawals {
+        let mut op_return_data = Vec::new();
+        op_return_data.extend_from_slice(&hex::decode(w.id)?);
 
-    self.transaction_builder
-        .build_transaction_with_op_return(
-            outputs,
-            OP_RETURN_WITHDRAW_PREFIX,
-            vec![proof_txid.as_raw_hash().to_byte_array()],
-        )
-        .await
+        outputs.push(TransactionOutput {
+            output: TxOut {
+                value: w.amount,
+                script_pubkey: w.receiver.script_pubkey(),
+            },
+            op_return_data: Some(op_return_data),
+        });
+    }
+
+    let mut op_return_prefix = Vec::new();
+    op_return_prefix.extend_from_slice(OP_RETURN_WITHDRAW_PREFIX);
+    op_return_prefix.push(WITHDRAWAL_VERSION as u8);
+
+    let config = TransactionBuilderConfig {
+        fee_strategy: Arc::new(WithdrawalFeeStrategy::new()),
+        max_tx_weight: MAX_STANDARD_TX_WEIGHT as u64,
+        max_output_per_tx: WITHDRAWAL_LIMIT as usize,
+        op_return_prefix,
+        bridge_address: self.get_system_wallets().await?.bridge,
+        default_fee_rate_opt: None,
+        default_available_utxos_opt: None,
+        op_return_data_input_opt: None,
+    };
+
+    let unsigned_txs = self
+        .transaction_builder
+        .build_transaction_with_op_return(outputs, config)
+        .await?;
+
+    if unsigned_txs.is_empty() {
+        return Ok(None);
+    }
+
+    let sig_hashes = self
+        .transaction_builder
+        .get_tr_sighashes(&unsigned_txs[0])?;
+
+    Ok(Some(SessionOperation::Withdrawal(
+        unsigned_txs[0].clone(),
+        sig_hashes,
+    )))
 }
 ```
-> Update Transaction weight-based splitting and API changes
->
-> - Large withdrawals are now split across multiple bridge transactions when the estimated transaction weight approaches the standard policy limit.
-> - Constants and weight math live in [via_verifier/lib/via_musig2/src/constants.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/constants.rs#L1) and include INPUT_BASE_SIZE, INPUT_WITNESS_SIZE, OUTPUT_SIZE, OP_RETURN_SIZE, TX_OVERHEAD, WITNESS_OVERHEAD, FIXED_OVERHEAD_WEIGHT, and AVAILABLE_WEIGHT (based on bitcoin::policy::MAX_STANDARD_TX_WEIGHT).
-> - Fee calculation was updated to be witness-aware and align with the new sizing model: see [via_verifier/lib/via_musig2/src/fee.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/fee.rs).
-> - TransactionBuilder APIs:
->   - [rust TransactionBuilder::estimate_transaction_weight()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/transaction_builder.rs) estimates total weight from input/output counts.
->   - [rust TransactionBuilder::get_transaction_metadata()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/transaction_builder.rs) partitions inputs/outputs into chunks that fit within a configurable weight limit.
->   - [rust TransactionBuilder::build_bridge_txs()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/transaction_builder.rs) materializes signed-ready transaction skeletons from the metadata chunks.
->   - [rust TransactionBuilder::build_transaction_with_op_return()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/transaction_builder.rs) now returns Vec&lt;UnsignedBridgeTx&gt; and accepts a weight_limit parameter (e.g., MAX_STANDARD_TX_WEIGHT) and op_return_data as Vec&lt;&amp;Vec&lt;u8&gt;&gt;.
->
-> Updated signature (simplified):
->
-> ```rust
-> // via_verifier/lib/via_musig2/src/transaction_builder.rs
-> pub async fn build_transaction_with_op_return(
->     &self,
->     outputs: Vec<TxOut>,
->     op_return_prefix: &[u8],
->     op_return_data: Vec<&Vec<u8>>,
->     fee_strategy: Arc<dyn FeeStrategy>,
->     change_output: Option<TxOut>,
->     max_outputs_per_tx: Option<usize>,
->     weight_limit: u64, // e.g. bitcoin::policy::MAX_STANDARD_TX_WEIGHT
-> ) -> anyhow::Result<Vec<UnsignedBridgeTx>> { /* ... */ }
-> ```
->
-> Example usage (examples updated to pick the first tx when only a single transaction is needed):
->
-> - [via_verifier/lib/via_musig2/examples/coordinator.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/examples/coordinator.rs#L447)
-> - [via_verifier/lib/via_musig2/examples/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/examples/withdrawal.rs#L129)
->
-> Test coverage for chunking and weight enforcement:
->
-> - [via_verifier/lib/via_musig2/src/test/bridge_tx.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/test/bridge_tx.rs#L334)
-> - [via_verifier/lib/via_musig2/src/test/chunk_outputs.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/test/chunk_outputs.rs#L1)
-> - [via_verifier/lib/via_musig2/src/test/mod.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/test/mod.rs#L1)
+
+Notable properties of the current flow:
+
+- Withdrawals below `min_value` (660 sats, covering dust plus fee) are filtered out at the DAL level
+- The `VIA_WI` OP_RETURN prefix is followed by a 1-byte `WITHDRAWAL_VERSION`
+- Large withdrawal sets are split across multiple bridge transactions by weight (`max_tx_weight`, based on `bitcoin::policy::MAX_STANDARD_TX_WEIGHT`) and by output count (`max_output_per_tx`); the session signs one transaction at a time
+- The `SessionOperation::Withdrawal` payload carries one sighash **per input** (`get_tr_sighashes`), because each input is signed in its own MuSig2 session
+- Weight math constants (INPUT_BASE_SIZE, INPUT_WITNESS_SIZE, OUTPUT_SIZE, OP_RETURN_SIZE, TX_OVERHEAD, WITNESS_OVERHEAD) live in `via_verifier/lib/via_musig2/src/constants.rs`; the witness-aware fee model is in `via_verifier/lib/via_musig2/src/fee.rs`; chunking and weight enforcement are covered by tests in `via_verifier/lib/via_musig2/src/test/`
 
 ### 3.2 Security Benefits
 
@@ -166,15 +181,21 @@ let (xonly_agg_key, _) = agg_pubkey.x_only_public_key();
 let internal_key = bitcoin::XOnlyPublicKey::from_slice(&xonly_agg_key.serialize())?;
 
 // Calculate taproot tweak
-let tap_tweak = TapTweakHash::from_key_and_tweak(internal_key, None);
+// merkle_root is the optional script-tree root: Some(..) when the bridge
+// address commits to a governance script path, None for key-path-only
+let tap_tweak = TapTweakHash::from_key_and_tweak(internal_key, merkle_root);
 let tweak = tap_tweak.to_scalar();
 let tweak_bytes = tweak.to_be_bytes();
-let musig2_compatible_tweak = secp256k1_musig2::Scalar::from_be_bytes(tweak_bytes).unwrap();
+let musig2_compatible_tweak = secp256k1_musig2::Scalar::from_be_bytes(tweak_bytes)
+    .with_context(|| TAPROOT_TWEAK_SCALAR_RANGE_ERR)
+    .map_err(|e| MusigError::Musig2Error(e.to_string()))?;
 // Apply tweak to the key aggregation context before signing
 musig_key_agg_cache = musig_key_agg_cache
     .with_xonly_tweak(musig2_compatible_tweak)
     .map_err(|e| MusigError::Musig2Error(format!("Failed to apply tweak: {}", e)))?;
 ```
+
+The `merkle_root` passed here must be the same one used when deriving the bridge address; a mismatch produces signatures that are invalid for the address.
 
 ### 4.3 Multi-Round Signing Protocol
 
@@ -282,51 +303,109 @@ Withdrawal fee accounting:
 - Per-user fee equals `total_fee / outputs_count`. If there are no withdrawal outputs (e.g., all requests are too small after fee filtering), [rust UnsignedBridgeTx::get_fee_per_user()](via_verifier/lib/via_verifier_types/src/transaction.rs:96) returns the total fee to avoid division by zero and keep accounting consistent.
 - If the constructed unsigned transaction ends up with no withdrawal outputs, the builder treats it as a no-op and does not insert it into the UTXO manager; see [rust TransactionBuilder::build_transaction_with_op_return()](via_verifier/lib/via_musig2/src/transaction_builder.rs:58).
 
-The `transaction_builder.rs` module handles the construction of Bitcoin transactions that will be signed using MuSig2:
+The `transaction_builder.rs` module handles the construction of Bitcoin transactions that will be signed using MuSig2. The entry point takes a `TransactionBuilderConfig` and can return **multiple** unsigned transactions when the withdrawal set exceeds the weight or output limits:
 
 ```rust
+// via_verifier/lib/via_musig2/src/types.rs
+#[derive(Clone)]
+pub struct TransactionBuilderConfig {
+    /// The fee strategy
+    pub fee_strategy: Arc<dyn FeeStrategy>,
+    /// The max tx weight
+    pub max_tx_weight: u64,
+    /// The max number of output to include in each transaction
+    pub max_output_per_tx: usize,
+    /// The OP_RETURN prefix
+    pub op_return_prefix: Vec<u8>,
+    /// Bridge address
+    pub bridge_address: Address,
+    /// The fee rate.
+    pub default_fee_rate_opt: Option<u64>,
+    /// The transaction fee rate
+    pub default_available_utxos_opt: Option<Vec<(OutPoint, TxOut)>>,
+    // ...
+}
+
 // via_verifier/lib/via_musig2/src/transaction_builder.rs
 pub async fn build_transaction_with_op_return(
     &self,
-    mut outputs: Vec<TxOut>,
-    op_return_prefix: &[u8],
-    op_return_data: Vec<[u8; 32]>,
-) -> Result<UnsignedBridgeTx> {
-    // ... transaction building logic ...
+    outputs: Vec<TransactionOutput>,
+    config: TransactionBuilderConfig,
+) -> Result<Vec<UnsignedBridgeTx>> {
+    self.utxo_manager.sync_context_with_blockchain().await?;
 
-    // Create unsigned transaction
-    let unsigned_tx = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: inputs,
-        output: outputs.clone(),
-    };
+    let available_utxos = self.get_available_utxos(&config).await?;
+    let fee_rate = self.get_fee_rate(&config).await?;
 
-    let txid = unsigned_tx.compute_txid();
-
-    // ... more logic ...
-
-    Ok(UnsignedBridgeTx {
-        tx: unsigned_tx,
-        txid,
-        utxos: selected_utxos,
-        change_amount,
-    })
+    self.build_bridge_txs(available_utxos, outputs, config, fee_rate)
+        .await
 }
 
-pub fn get_tr_sighash(&self, unsigned_tx: &UnsignedBridgeTx) -> anyhow::Result<TapSighash> {
+pub async fn build_bridge_txs(
+    &self,
+    available_utxos: Vec<(OutPoint, TxOut)>,
+    outputs: Vec<TransactionOutput>,
+    config: TransactionBuilderConfig,
+    fee_rate: u64,
+) -> Result<Vec<UnsignedBridgeTx>> {
+    let output_chunks = self.chunk_outputs(&outputs, config.max_output_per_tx);
+    let mut utxos_pool = available_utxos;
+    let mut bridge_txs = Vec::new();
+    // ... per-chunk selection, fee calculation, weight enforcement ...
+}
+```
+
+The result type carries fee metadata alongside the transaction (`via_verifier/lib/via_verifier_types/src/transaction.rs`):
+
+```rust
+pub struct UnsignedBridgeTx {
+    pub tx: Transaction,
+    pub txid: Txid,
+    pub utxos: Vec<(OutPoint, TxOut)>,
+    pub change_amount: Amount,
+    pub fee: Amount,
+    pub fee_rate: u64,
+}
+```
+
+Sighash computation is per input; each input gets its own MuSig2 signing session:
+
+```rust
+pub fn get_tr_sighashes(&self, unsigned_tx: &UnsignedBridgeTx) -> Result<Vec<Vec<u8>>> {
     let mut sighash_cache = SighashCache::new(&unsigned_tx.tx);
     let sighash_type = TapSighashType::All;
-    let mut txout_list = Vec::with_capacity(unsigned_tx.utxos.len());
 
-    for (_, txout) in unsigned_tx.utxos.clone() {
-        txout_list.push(txout);
+    let txout_list: Vec<TxOut> = unsigned_tx
+        .utxos
+        .iter()
+        .map(|(_, txout)| txout.clone())
+        .collect();
+
+    let mut sighashes = Vec::new();
+    for (i, _) in txout_list.iter().enumerate() {
+        let sighash = sighash_cache
+            .taproot_key_spend_signature_hash(i, &Prevouts::All(&txout_list), sighash_type)
+            .context("Error taproot_key_spend_signature_hash")?;
+        sighashes.push(sighash.to_raw_hash().to_byte_array().to_vec());
     }
-    let sighash = sighash_cache
-        .taproot_key_spend_signature_hash(0, &Prevouts::All(&txout_list), sighash_type)
-        .with_context(|| "Error taproot_key_spend_signature_hash")?;
 
-    Ok(sighash)
+    Ok(sighashes)
+}
+```
+
+Correspondingly, the withdrawal verifier maintains per-input signing state (`via_verifier_coordinator/src/verifier/mod.rs`):
+
+```rust
+pub struct ViaWithdrawalVerifier {
+    verifier_config: ViaVerifierConfig,
+    wallet: ViaWallet,
+    session_manager: SessionManager,
+    btc_client: Arc<dyn BitcoinOps>,
+    master_connection_pool: ConnectionPool<Verifier>,
+    client: Client,
+    signer_per_utxo_input: BTreeMap<usize, Signer>,
+    final_sig_per_utxo_input: BTreeMap<usize, CompactSignature>,
+    // ...
 }
 ```
 
@@ -380,24 +459,51 @@ Regular Verifier nodes participate in the MuSig2 protocol by submitting nonces a
 ```rust
 // via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs
 async fn loop_iteration(&mut self) -> Result<(), anyhow::Error> {
+    self.session_manager.prepare_session().await?;
+
+    if self.state.is_reorg_in_progress().await? {
+        return Ok(());
+    }
+
+    if self.state.is_sync_in_progress().await? {
+        return Ok(());
+    }
+
+    self.validate_verifier_addresses().await?;
+
     let mut session_info = self.get_session().await?;
-    
-    // ... process session ...
-    
-    if session_info.received_nonces < session_info.required_signers {
-        if !session_nonces.contains_key(&verifier_index) {
-            self.submit_nonce().await?;
-        }
-    } else if session_info.received_nonces >= session_info.required_signers {
-        if self.signer.has_created_partial_sig() {
+
+    if self.is_coordinator() {
+        self.create_new_session().await?;
+        session_info = self.get_session().await?;
+
+        if session_info.session_op.is_empty() {
+            tracing::debug!("Empty session, nothing to process");
             return Ok(());
         }
-        self.submit_partial_signature(session_nonces).await?;
+
+        let session_op = SessionOperation::from_bytes(&session_info.session_op);
+
+        if !self
+            .session_manager
+            .before_process_session(&session_op)
+            .await?
+        {
+            tracing::debug!("Session already processed");
+            return Ok(());
+        }
     }
-    
-    Ok(())
+
+    if session_info.session_op.is_empty() {
+        tracing::debug!("Empty session, nothing to process");
+        return Ok(());
+    }
+    let session_op = SessionOperation::from_bytes(&session_info.session_op);
+    // ... nonce submission, partial signature submission, final broadcast ...
 }
 ```
+
+The loop refuses to participate while a Bitcoin reorg or state sync is in progress, and re-validates the verifier address set every iteration. Nonce and partial-signature submission then proceed per input, mirroring the per-input signer map.
 
 ## 6. Withdrawal Processing Flow
 
@@ -425,33 +531,40 @@ async fn build_and_broadcast_final_transaction(
     session_info: &SigningSessionResponse,
     session_op: &SessionOperation,
 ) -> anyhow::Result<bool> {
-    if session_info.received_partial_signatures < session_info.required_signers {
+    let input_index = 0;
+    let received_partial_signatures = session_info
+        .received_partial_signatures
+        .get(&input_index)
+        .map_or(0, |len| *len);
+
+    if received_partial_signatures < session_info.required_signers {
         return Ok(false);
     }
 
-    if let Some((unsigned_tx, message)) = session_op.session() {
-        self.create_final_signature(message)
-            .await
-            .map_err(|e| anyhow::format_err!("Error create final signature: {e}"))?;
+    let unsigned_tx = session_op.get_unsigned_bridge_tx();
+    let messages = session_op.get_message_to_sign();
 
-        if let Some(musig2_signature) = self.final_sig {
-            // ... verify and prepare transaction ...
+    self.create_final_signature(&messages)
+        .await
+        .map_err(|e| anyhow::format_err!("Error create final signature: {e}"))?;
 
-            let signed_tx = self.sign_transaction(unsigned_tx.clone(), musig2_signature);
-
-            let txid = self
-                .btc_client
-                .broadcast_signed_transaction(&signed_tx)
-                .await?;
-
-            // ... update state ...
-
-            return Ok(true);
+    if !self.final_sig_per_utxo_input.is_empty() {
+        if !self
+            .session_manager
+            .before_broadcast_final_transaction(session_op)
+            .await?
+        {
+            return Ok(false);
         }
+
+        let signed_tx = self.sign_transaction(unsigned_tx.clone());
+        // ... broadcast_signed_transaction, update state ...
     }
-    Ok(false)
+    // ...
 }
 ```
+
+Note the per-input bookkeeping: partial-signature counts are tracked per input index, the final aggregation fills `final_sig_per_utxo_input` (one `CompactSignature` per input), and `sign_transaction` attaches each input's aggregated Schnorr signature to its witness.
 
 ## 7. Key Management
 
@@ -494,17 +607,20 @@ fn create_bridge_address(
 The Verifier nodes store their private keys securely and use them to participate in the MuSig2 protocol. The current implementation uses an n-of-n signature scheme, requiring all Verifiers to participate in the signing process.
 
 ```rust
-// via_verifier/node/via_verifier_coordinator/src/coordinator/api_decl.rs
-let state = ViaWithdrawalState {
-    signing_session: Arc::new(RwLock::new(SigningSession::default())),
-    required_signers: config.required_signers,
-    verifiers_pub_keys: config
-        .verifiers_pub_keys_str
-        .iter()
-        .map(|s| bitcoin::secp256k1::PublicKey::from_str(s).unwrap())
-        .collect(),
-    verifier_request_timeout: config.verifier_request_timeout,
-};
+// via_verifier/node/via_verifier_coordinator/src/types.rs
+pub struct ViaWithdrawalState {
+    pub signing_session: Arc<RwLock<SigningSession>>,
+    pub verifiers_pub_keys: Vec<bitcoin::secp256k1::PublicKey>,
+    pub verifier_request_timeout: u8,
+    pub session_timeout: u64,
+}
+```
+
+There is no separate `required_signers` configuration: the coordinator derives it as the full verifier set, making n-of-n structural rather than configurable:
+
+```rust
+// via_verifier/node/via_verifier_coordinator/src/coordinator/api_impl.rs
+required_signers: self_.state.verifiers_pub_keys.len(),
 ```
 
 ## 8. Current Limitations and Future Improvements

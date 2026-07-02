@@ -48,7 +48,7 @@ The first stage of the aggregation process involves generating proofs for the ba
 - `ZkSyncBaseLayerProof` objects for each basic circuit
 
 **Code Reference**:
-- The basic circuit witness generation is implemented in `prover/crates/bin/witness_generator/src/basic_circuits.rs`
+- The witness generators live under `prover/crates/bin/witness_generator/src/rounds/` (one module per aggregation round; the flat `src/basic_circuits.rs` layout referenced by older docs was reorganized). This prover pipeline is inherited from zksync-era; Via's divergence begins after the compressed proof exists (DA dispatch to Celestia and Bitcoin inscription instead of an Ethereum verifier contract).
 
 ### 3.2 Leaf Aggregation (Round 1)
 

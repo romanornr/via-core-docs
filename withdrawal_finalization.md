@@ -56,31 +56,78 @@ The withdrawal finalization process consists of several sequential steps:
 
 ### 3.1 Withdrawal Detection
 
-1. The `WithdrawalSession` identifies finalized L1 batches with pending withdrawals:
+1. The `WithdrawalSession` pulls unprocessed withdrawals from the database (populated when withdrawals from finalized batches are indexed) and builds the session directly:
 
 ```rust
 // via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs
-#[axum::async_trait]
-impl ISession for WithdrawalSession {
-    async fn session(&self) -> anyhow::Result<Option<SessionOperation>> {
-        // Load the next work unit, if any
-        let (l1_batch_number, raw_proof_tx_id, withdrawals_to_process) =
-            self.prepare_withdrawal_session().await?;
+async fn session(&self) -> anyhow::Result<Option<SessionOperation>> {
+    let mut storage = self
+        .master_connection_pool
+        .connection_tagged("verifier task")
+        .await?;
 
-        if withdrawals_to_process.is_empty() {
-            return Ok(None);
-        }
+    // Set the minimum amount to withdraw + fee = 660 sats.
+    let min_value = 660;
 
-        // ... construct and verify unsigned tx, proceed with the session ...
+    let no_processed_withdrawals = storage
+        .via_withdrawal_dal()
+        .list_no_processed_withdrawals(min_value, WITHDRAWAL_LIMIT)
+        .await?;
+
+    if no_processed_withdrawals.is_empty() {
+        return Ok(None);
     }
+
+    let mut outputs = vec![];
+    for w in no_processed_withdrawals {
+        let mut op_return_data = Vec::new();
+        op_return_data.extend_from_slice(&hex::decode(w.id)?);
+
+        outputs.push(TransactionOutput {
+            output: TxOut {
+                value: w.amount,
+                script_pubkey: w.receiver.script_pubkey(),
+            },
+            op_return_data: Some(op_return_data),
+        });
+    }
+
+    let mut op_return_prefix = Vec::new();
+    op_return_prefix.extend_from_slice(OP_RETURN_WITHDRAW_PREFIX);
+    op_return_prefix.push(WITHDRAWAL_VERSION as u8);
+
+    let config = TransactionBuilderConfig {
+        fee_strategy: Arc::new(WithdrawalFeeStrategy::new()),
+        max_tx_weight: MAX_STANDARD_TX_WEIGHT as u64,
+        max_output_per_tx: WITHDRAWAL_LIMIT as usize,
+        op_return_prefix,
+        bridge_address: self.get_system_wallets().await?.bridge,
+        default_fee_rate_opt: None,
+        default_available_utxos_opt: None,
+        op_return_data_input_opt: None,
+    };
+
+    let unsigned_txs = self
+        .transaction_builder
+        .build_transaction_with_op_return(outputs, config)
+        .await?;
+
+    if unsigned_txs.is_empty() {
+        return Ok(None);
+    }
+
+    let sig_hashes = self
+        .transaction_builder
+        .get_tr_sighashes(&unsigned_txs[0])?;
+
+    Ok(Some(SessionOperation::Withdrawal(
+        unsigned_txs[0].clone(),
+        sig_hashes,
+    )))
 }
 ```
 
-Helper
-- The helper prepares the next work unit:
-  - Returns (l1_batch_number: i64, raw_proof_tx_id: Vec<u8>, withdrawals: Vec<WithdrawalRequest>)
-  - If a finalized batch contains no withdrawals, it marks the vote transaction as processed and continues scanning.
-- See file: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs)
+Each withdrawal is keyed by an id (hex, embedded in the OP_RETURN data of its output) and the batch is capped at `WITHDRAWAL_LIMIT` entries with a 660 sat minimum per withdrawal.
 
 2. The `WithdrawalClient` retrieves withdrawal requests from the data availability layer:
 
@@ -95,154 +142,117 @@ pub async fn get_withdrawals(&self, blob_id: &str) -> anyhow::Result<Vec<Withdra
 }
 ```
 
-3. Withdrawal messages are parsed from L2 bridge logs:
+3. Withdrawal messages are parsed from L2→L1 messages and cross-validated against the `Withdrawal` event log:
 
 ```rust
 // via_verifier/lib/via_withdrawal_client/src/withdraw.rs
 pub fn parse_l2_withdrawal_message(
     l2_to_l1_message: Vec<u8>,
+    log: Log,
     network: Network,
 ) -> anyhow::Result<WithdrawalRequest> {
-    // Extract function selector, Bitcoin address, and amount
+    // Message layout: 4-byte selector ++ variable-length receiver ++ 32-byte amount
+    let message_len = l2_to_l1_message.len();
+    let address_size = message_len - 36;
+
     let func_selector_bytes = &l2_to_l1_message[0..4];
+    // (must equal the finalizeEthWithdrawal selector, used as a format tag)
+
     let address_bytes = &l2_to_l1_message[4..4 + address_size];
+    let address_str =
+        String::from_utf8(address_bytes.to_vec()).with_context(|| "Parse address to string")?;
+    let receiver = BitcoinAddress::from_str(&address_str)
+        .with_context(|| "parse bitcoin address")?
+        .require_network(network)?;
+
+    // The last 32 bytes represent the amount (uint256)
     let amount_bytes = &l2_to_l1_message[address_size + 4..];
-    
-    // Parse Bitcoin address and amount
-    let address_str = String::from_utf8(address_bytes.to_vec())?;
-    let address = BitcoinAddress::from_str(&address_str)?.require_network(network)?;
     let amount = Amount::from_sat(U256::from_big_endian(amount_bytes).as_u64());
-    
-    Ok(WithdrawalRequest { address, amount })
+
+    // Cross-check against the Withdrawal event log: same receiver, same amount
+    let l2_sender = Address::from_slice(&log.topics[1].as_bytes()[12..]);
+    let tokens = decode(&[ParamType::Bytes, ParamType::Uint(256)], &log.data.0)?;
+    // ... decode log receiver + amount, compare with message values ...
 }
 ```
+
+The receiver is a **variable-length Bitcoin address** (`address_size = message_len - 36`), and the parsed result carries full provenance:
+
+```rust
+// via_verifier/lib/via_verifier_types/src/withdrawal.rs
+pub struct WithdrawalRequest {
+    pub id: String,
+    pub receiver: BitcoinAddress,
+    pub amount: Amount,
+    pub l2_sender: Address,
+    pub l2_tx_hash: String,
+    pub l2_tx_log_index: u16,
+}
+```
+
+The `id` is what later appears in the bridge transaction's OP_RETURN data, tying each Bitcoin output back to the exact L2 withdrawal it pays.
 
 ### 3.2 Transaction Construction
 
-1. The `WithdrawalSession` creates an unsigned transaction for the withdrawals:
+1. The unsigned transaction is built inside `session()` (shown above): withdrawal outputs carry their withdrawal ids as OP_RETURN data, and the `TransactionBuilder` receives everything through a `TransactionBuilderConfig`.
 
-```rust
-// via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs
-pub async fn create_unsigned_tx(
-    &self,
-    withdrawals: Vec<WithdrawalRequest>,
-    proof_txid: Txid,
-) -> anyhow::Result<UnsignedBridgeTx> {
-    // Group withdrawals by address and sum amounts
-    let mut grouped_withdrawals: HashMap<Address, Amount> = HashMap::new();
-    for w in withdrawals {
-        *grouped_withdrawals.entry(w.address).or_insert(Amount::ZERO) = grouped_withdrawals
-            .get(&w.address)
-            .unwrap_or(&Amount::ZERO)
-            .checked_add(w.amount)?;
-    }
-
-    // Create outputs for grouped withdrawals
-    let outputs: Vec<TxOut> = grouped_withdrawals
-        .into_iter()
-        .map(|(address, amount)| TxOut {
-            value: amount,
-            script_pubkey: address.script_pubkey(),
-        })
-        .collect();
-
-    self.transaction_builder
-        .build_transaction_with_op_return(
-            outputs,
-            OP_RETURN_WITHDRAW_PREFIX,
-            vec![proof_txid.as_raw_hash().to_byte_array()],
-        )
-        .await
-}
-```
-
-2. The `TransactionBuilder` constructs the Bitcoin transaction with:
-   - Outputs for each withdrawal recipient
-   - An OP_RETURN output containing the proof transaction ID
-   - A change output back to the bridge address (if needed)
+2. The `TransactionBuilder` constructs one or more Bitcoin transactions (splitting by weight and output count):
 
 ```rust
 // via_verifier/lib/via_musig2/src/transaction_builder.rs
 pub async fn build_transaction_with_op_return(
     &self,
-    mut outputs: Vec<TxOut>,
-    op_return_prefix: &[u8],
-    op_return_data: Vec<[u8; 32]>,
-) -> Result<UnsignedBridgeTx> {
-    // Sync UTXOs with blockchain
+    outputs: Vec<TransactionOutput>,
+    config: TransactionBuilderConfig,
+) -> Result<Vec<UnsignedBridgeTx>> {
     self.utxo_manager.sync_context_with_blockchain().await?;
-    
-    // Calculate total required amount
-    let mut total_required_amount: Amount = Amount::ZERO;
-    for output in &outputs {
-        total_required_amount = total_required_amount.checked_add(output.value)?;
-    }
-    
-    // Select UTXOs and calculate fee
-    let selected_utxos = self.utxo_manager.select_utxos_by_target_value(&available_utxos, total_needed).await?;
-    
-    // Create OP_RETURN output with proof txid
-    let op_return_data = TransactionBuilder::create_op_return_script(op_return_prefix, op_return_data)?;
-    let op_return_output = TxOut {
-        value: Amount::ZERO,
-        script_pubkey: op_return_data,
-    };
-    
-    // Add outputs and create transaction
-    outputs.push(op_return_output);
-    
-    // Add change output if needed
-    if change_amount.to_sat() > 0 {
-        outputs.push(TxOut {
-            value: change_amount,
-            script_pubkey: self.bridge_address.script_pubkey(),
-        });
-    }
-    
-    // Create unsigned transaction
-    let unsigned_tx = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: inputs,
-        output: outputs.clone(),
-    };
-    
-    Ok(UnsignedBridgeTx {
-        tx: unsigned_tx,
-        txid,
-        utxos: selected_utxos,
-        change_amount,
-    })
+
+    let available_utxos = self.get_available_utxos(&config).await?;
+    let fee_rate = self.get_fee_rate(&config).await?;
+
+    self.build_bridge_txs(available_utxos, outputs, config, fee_rate)
+        .await
 }
 ```
 
-3. The transaction is verified to ensure it correctly includes all withdrawals:
+Each resulting transaction contains:
+   - Outputs for each withdrawal recipient
+   - An OP_RETURN output with the `VIA_WI` prefix, a version byte, and the withdrawal ids paid by this transaction
+   - A change output back to the bridge address (if needed)
+
+See `musig2_implementation.md` for `TransactionBuilderConfig` and `build_bridge_txs` internals.
+
+3. Every verifier (not just the coordinator) verifies the session before signing:
 
 ```rust
 // via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs
-async fn _verify_withdrawals(
-    &self,
-    l1_batch_number: i64,
-    unsigned_tx: &UnsignedBridgeTx,
-    blob_id: &str,
-    proof_tx_id: Vec<u8>,
-) -> anyhow::Result<bool> {
-    let withdrawals = self.withdrawal_client.get_withdrawals(blob_id).await?;
-    
-    // Group withdrawals and verify amounts
-    // ...
-    
-    // Verify the OP_RETURN output contains the correct proof txid
-    let tx_id = h256_to_txid(&proof_tx_id)?;
-    let op_return_data = TransactionBuilder::create_op_return_script(
-        OP_RETURN_WITHDRAW_PREFIX,
-        vec![*tx_id.as_raw_hash().as_byte_array()],
-    )?;
-    
-    // Verify OP_RETURN output matches expected data
-    // ...
-    
+async fn verify_message(&self, session_op: &SessionOperation) -> anyhow::Result<bool> {
+    let messages = session_op.get_message_to_sign();
+    let unsigned_tx = session_op.get_unsigned_bridge_tx();
+
+    if !self._verify_withdrawals(&session_op).await? {
+        tracing::error!("Failed to verify session withdrawals");
+        return Ok(false);
+    }
+
+    if !self._verify_sighashes(&unsigned_tx, &messages).await? {
+        tracing::error!("Failed to verify session message");
+        return Ok(false);
+    }
+
     Ok(true)
+}
+```
+
+The verification includes a **fee-rate tolerance check**: the fee rate baked into the unsigned transaction must be within ±1 sat/vbyte of the verifier's own current estimate:
+
+```rust
+// via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs
+let used_fee_rate = session_op.get_unsigned_bridge_tx().fee_rate;
+
+// Acceptable if difference is within ±1 sat/vbyte
+if (used_fee_rate as i32 - fee_rate as i32).abs() > 1 {
+    // reject the session
 }
 ```
 
@@ -263,21 +273,44 @@ async fn _verify_withdrawals(
 pub async fn new_session(
     State(self_): State<Arc<Self>>,
 ) -> anyhow::Result<Response<String>, ApiError> {
-    // Check if there's an existing session in progress
-    
-    if let Some(session_op) = self_.session_manager.get_next_session().await? {
-        // Create a new signing session
-        let new_session = SigningSession {
-            session_op: Some(session_op),
-            received_nonces: HashMap::new(),
-            received_sigs: HashMap::new(),
-        };
-        
-        let mut signing_session = self_.state.signing_session.write().await;
-        *signing_session = new_session;
+    let current_session_op_opt = {
+        let current_session_op_opt =
+            self_.state.signing_session.read().await.session_op.clone();
+        current_session_op_opt
+    };
+
+    if let Some(current_session) = current_session_op_opt {
+        if self_
+            .session_manager
+            .is_session_in_progress(&current_session)
+            .await?
+        {
+            return Ok(ok_json(""));
+        }
+
+        if !self_.is_session_timeout().await {
+            // wait for the session timeout before replacing it
+            return Ok(ok_json(""));
+        }
     }
-    
+
+    if let Some(session_op) = self_.session_manager.get_next_session().await? {
+        // ... install the new SigningSession ...
+    }
     // ...
+}
+```
+
+The session state tracks nonces and partial signatures **per input** (outer key = input index, inner key = signer index):
+
+```rust
+// via_verifier/node/via_verifier_coordinator/src/types.rs
+#[derive(Default, Debug, Clone)]
+pub struct SigningSession {
+    pub session_op: Option<SessionOperation>,
+    pub received_nonces: BTreeMap<usize, BTreeMap<usize, PubNonce>>,
+    pub received_sigs: BTreeMap<usize, BTreeMap<usize, PartialSignature>>,
+    pub created_at: u64,
 }
 ```
 
@@ -290,96 +323,84 @@ pub async fn new_session(
 ```rust
 // via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs
 async fn loop_iteration(&mut self) -> Result<(), anyhow::Error> {
-    let mut session_info = self.get_session().await?;
-    
-    // ...
-    
-    if session_info.received_nonces < session_info.required_signers {
-        if !session_nonces.contains_key(&verifier_index) {
-            self.submit_nonce().await?;
-        }
-    } else if session_info.received_nonces >= session_info.required_signers {
-        if self.signer.has_created_partial_sig() {
-            return Ok(());
-        }
-        self.submit_partial_signature(session_nonces).await?;
+    self.session_manager.prepare_session().await?;
+
+    if self.state.is_reorg_in_progress().await? {
+        return Ok(());
     }
-    
-    Ok(())
+
+    if self.state.is_sync_in_progress().await? {
+        return Ok(());
+    }
+
+    self.validate_verifier_addresses().await?;
+
+    let mut session_info = self.get_session().await?;
+
+    if self.is_coordinator() {
+        self.create_new_session().await?;
+        session_info = self.get_session().await?;
+        // ... skip empty or already-processed sessions ...
+    }
+
+    if session_info.session_op.is_empty() {
+        return Ok(());
+    }
+    let session_op = SessionOperation::from_bytes(&session_info.session_op);
+    // ... verify_message, then per-input nonce and partial-signature submission ...
 }
 ```
 
-3. The Coordinator collects nonces and partial signatures:
-
-```rust
-// via_verifier/node/via_verifier_coordinator/src/coordinator/api_impl.rs
-pub async fn submit_nonce(
-    State(self_): State<Arc<Self>>,
-    Json(nonce_pair): Json<NoncePair>,
-) -> anyhow::Result<Response<String>, ApiError> {
-    // Decode and validate nonce
-    
-    let mut session = self_.state.signing_session.write().await;
-    session.received_nonces.insert(nonce_pair.signer_index, pub_nonce);
-    
-    Ok(ok_json("Success"))
-}
-
-pub async fn submit_partial_signature(
-    State(self_): State<Arc<Self>>,
-    Json(sig_pair): Json<PartialSignaturePair>,
-) -> anyhow::Result<Response<String>, ApiError> {
-    // Decode and validate signature
-    
-    let mut session = self_.state.signing_session.write().await;
-    session.received_sigs.insert(sig_pair.signer_index, partial_sig);
-    
-    Ok(ok_json("Success"))
-}
-```
+3. The Coordinator collects nonces and partial signatures through the REST endpoints (`submit_nonce`, `submit_partial_signature`), storing them in the per-input nested maps of `SigningSession` shown above. Each verifier runs one MuSig2 round per transaction input.
 
 ### 3.4 Final Signature Aggregation and Transaction Broadcasting
 
-1. The Coordinator aggregates the partial signatures into a final signature:
+1. The Coordinator aggregates the partial signatures into one final signature **per input**:
 
 ```rust
 // via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs
-async fn create_final_signature(&mut self, message: &[u8]) -> anyhow::Result<()> {
-    if self.final_sig.is_some() {
+pub async fn create_final_signature(&mut self, messages: &[Vec<u8>]) -> anyhow::Result<()> {
+    if !self.final_sig_per_utxo_input.is_empty() {
         return Ok(());
     }
 
     let signatures = self.get_session_signatures().await?;
-    for (&i, sig) in &signatures {
-        if self.signer.signer_index() != i {
-            self.signer.receive_partial_signature(i, *sig)?;
-        }
+    let input_count = self.signer_per_utxo_input.len();
+
+    if signatures.len() != input_count {
+        anyhow::bail!(
+            "Mismatch: expected signatures for {} inputs, but got {}",
+            input_count,
+            signatures.len()
+        );
     }
 
-    let final_sig = self.signer.create_final_signature()?;
-    let agg_pub = self.signer.aggregated_pubkey();
-    verify_signature(agg_pub, final_sig, message)?;
-    self.final_sig = Some(final_sig);
+    if messages.len() != input_count {
+        anyhow::bail!(
+            "Mismatch: expected messages for {} inputs, but got {}",
+            input_count,
+            messages.len()
+        );
+    }
 
-    Ok(())
+    let mut final_sig_per_utxo_input = BTreeMap::new();
+    // ... per input: feed partial signatures into that input's Signer,
+    //     finalize, verify against that input's sighash, store ...
 }
 ```
 
-2. The final signature is applied to the transaction:
+2. Each input's aggregated signature is applied to its own witness:
 
 ```rust
 // via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs
-fn sign_transaction(
-    &self,
-    unsigned_tx: UnsignedBridgeTx,
-    musig2_signature: CompactSignature,
-) -> String {
+fn sign_transaction(&self, unsigned_tx: UnsignedBridgeTx) -> String {
     let mut unsigned_tx = unsigned_tx;
-    let mut final_sig_with_hashtype = musig2_signature.serialize().to_vec();
     let sighash_type = TapSighashType::All;
-    final_sig_with_hashtype.push(sighash_type as u8);
-    for tx in &mut unsigned_tx.tx.input {
-        tx.witness = Witness::from(vec![final_sig_with_hashtype.clone()]);
+    for (input_index, musig2_signature) in self.final_sig_per_utxo_input.clone() {
+        let mut final_sig_with_hashtype = musig2_signature.serialize().to_vec();
+        final_sig_with_hashtype.push(sighash_type as u8);
+        unsigned_tx.tx.input[input_index].witness =
+            Witness::from(vec![final_sig_with_hashtype.clone()]);
     }
     bitcoin::consensus::encode::serialize_hex(&unsigned_tx.tx)
 }
@@ -394,38 +415,41 @@ async fn build_and_broadcast_final_transaction(
     session_info: &SigningSessionResponse,
     session_op: &SessionOperation,
 ) -> anyhow::Result<bool> {
-    if session_info.received_partial_signatures < session_info.required_signers {
+    let input_index = 0;
+    let received_partial_signatures = session_info
+        .received_partial_signatures
+        .get(&input_index)
+        .map_or(0, |len| *len);
+
+    if received_partial_signatures < session_info.required_signers {
         return Ok(false);
     }
 
-    if let Some((unsigned_tx, message)) = session_op.session() {
-        self.create_final_signature(message).await?;
+    let unsigned_tx = session_op.get_unsigned_bridge_tx();
+    let messages = session_op.get_message_to_sign();
 
-        if let Some(musig2_signature) = self.final_sig {
-            // Sign transaction
-            let signed_tx = self.sign_transaction(unsigned_tx.clone(), musig2_signature);
+    self.create_final_signature(&messages)
+        .await
+        .map_err(|e| anyhow::format_err!("Error create final signature: {e}"))?;
 
-            // Broadcast to Bitcoin network
-            let txid = self.btc_client.broadcast_signed_transaction(&signed_tx).await?;
-
-            tracing::info!(
-                "Broadcast {} signed transaction with txid {}",
-                &session_op.get_session_type(),
-                &txid.to_string()
-            );
-
-            // Update state to mark withdrawal as processed
-            self.session_manager.after_broadcast_final_transaction(txid, session_op).await?;
-            
-            self.reinit_signer()?;
-            return Ok(true);
+    if !self.final_sig_per_utxo_input.is_empty() {
+        if !self
+            .session_manager
+            .before_broadcast_final_transaction(session_op)
+            .await?
+        {
+            return Ok(false);
         }
+
+        let signed_tx = self.sign_transaction(unsigned_tx.clone());
+        // ... broadcast_signed_transaction, after_broadcast_final_transaction,
+        //     reinit signers ...
     }
-    Ok(false)
+    // ...
 }
 ```
 
-4. The withdrawal is marked as processed in the database:
+4. The withdrawals are marked as processed in one database transaction:
 
 ```rust
 // via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs
@@ -434,59 +458,107 @@ async fn after_broadcast_final_transaction(
     txid: Txid,
     session_op: &SessionOperation,
 ) -> anyhow::Result<bool> {
-    let votable_tx_id = self
-        .get_votable_tx_id(&session_op.get_proof_tx_id())
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Votable transaction does not exist"))?;
-
-    let hash_bytes = txid.to_byte_array().to_vec();
-
-    self.master_connection_pool
+    let mut storage = self
+        .master_connection_pool
         .connection_tagged("verifier task")
-        .await?
-        .via_bridge_dal()
-        .update_bridge_tx(votable_tx_id, session_op.index() as i64, &hash_bytes)
         .await?;
+    let mut transaction = storage.start_transaction().await?;
+
+    let id = transaction
+        .via_withdrawal_dal()
+        .insert_bridge_withdrawal_tx(&txid.as_byte_array().to_vec())
+        .await?;
+
+    let l1_withdrawals = self
+        .parse_bridge_withdrawal(session_op.get_unsigned_bridge_tx().tx.clone())
+        .await?;
+
+    let withdrawals = get_withdrawal_requests(l1_withdrawals);
+
+    transaction
+        .via_withdrawal_dal()
+        .mark_withdrawals_as_processed(id, &withdrawals)
+        .await?;
+
+    transaction.commit().await?;
 
     self.transaction_builder
         .utxo_manager_insert_transaction(session_op.get_unsigned_bridge_tx().tx.clone())
         .await;
 
-    tracing::info!(
-        "Final withdrawal transaction broadcasted: L1 batch {}, txid {}",
-        session_op.get_l1_batche_number(),
-        txid
-    );
+    tracing::info!("Final withdrawal transaction broadcasted: txid {}", txid);
 
     Ok(true)
 }
 ```
 
-Note: The DAL sets updated_at alongside bridge_tx_id and provides helpers to fetch by proof_reveal_tx_id and to update by l1_batch_number; see [via_verifier/lib/verifier_dal/src/via_votes_dal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/src/via_votes_dal.rs).
+Note the elegant closure here: the coordinator re-parses its **own** broadcast transaction with the same `parse_bridge_withdrawal` logic the indexer uses, so the set of withdrawals marked processed is exactly what the transaction actually pays. The unsigned tx is also inserted into the UTXO manager's pending context so the next session can chain on its change output before confirmation.
 
 ### 3.4 Multi-transaction withdrawals (weight-based splitting)
 
-- When the estimated transaction weight would exceed Bitcoin standard policy limits, the TransactionBuilder splits outputs across multiple bridge transactions, each constrained by `bitcoin::policy::MAX_STANDARD_TX_WEIGHT`.
-- `build_transaction_with_op_return` now returns a vector of unsigned transactions (`Vec<UnsignedBridgeTx>`). The Coordinator persists all unsigned candidates in the `via_bridge_tx` table; the row with an empty `hash` indicates the candidate to be signed. After broadcast, the `hash` is updated with the final txid for reconciliation.
-- Weight limit is configurable via [`rust ViaVerifierConfig::max_tx_weight()`](core/lib/config/src/configs/via_verifier.rs); default is `MAX_STANDARD_TX_WEIGHT - 20000`.
-- References:
-  - Weight constants and estimation: [via_verifier/lib/via_musig2/src/constants.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/constants.rs#L1), [via_verifier/lib/via_musig2/src/transaction_builder.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/src/transaction_builder.rs)
-  - Candidate persistence and lookup: [via_verifier/lib/verifier_dal/src/via_bridge.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/src/via_bridge.rs)
-  - Examples selecting the first tx when only one is needed: [via_verifier/lib/via_musig2/examples/coordinator.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/examples/coordinator.rs#L447), [via_verifier/lib/via_musig2/examples/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/via_musig2/examples/withdrawal.rs#L129)
+- When the estimated transaction weight would exceed Bitcoin standard policy limits, the TransactionBuilder splits outputs across multiple bridge transactions, each constrained by `max_tx_weight`.
+- `build_transaction_with_op_return` returns a vector of unsigned transactions (`Vec<UnsignedBridgeTx>`); the withdrawal session signs one per session (`unsigned_txs[0]`), and remaining withdrawals are picked up by subsequent sessions since they stay unprocessed in the database until paid.
+- The weight limit is configurable via `ViaVerifierConfig::max_tx_weight()` (`core/lib/config/src/configs/via_verifier.rs`); the default reserves a safety buffer below the policy limit:
 
-### 3.5 Withdrawal inscription intake (BTC Watch)
+```rust
+pub fn max_tx_weight(&self) -> u64 {
+    // Reserve 20000 weight units below Bitcoin's standard limit as a safety buffer
+    self.max_tx_weight
+        .unwrap_or((MAX_STANDARD_TX_WEIGHT - 20000).into())
+}
+```
 
-- Component: BTC Watch `WithdrawalProcessor`
-- Input: BridgeWithdrawal inscription (contains `l1_batch_proof_reveal_tx_id` and on-chain `tx_id`)
-- Behavior:
-  - Reverse bytes of `proof_reveal_tx_id` (endian handling) to form the H256 key
-  - Lookup `(votable_tx_id, l1_batch_number, bridge_tx_id)` by `(proof_reveal_tx_id, index_withdrawal)`; if none, warn and continue
-  - If `bridge_tx_id` already equals the indexed `tx_id`: treat as processed; return (idempotent)
-  - Else, update `bridge_tx_id` for `l1_batch_number` and set `METRICS.inscriptions_processed[Withdrawal]`
-  - Multiple transactions per batch are supported via `index_withdrawal`; updates are keyed by `(votable_tx_id, index_withdrawal)`. If an unexpected duplicate mapping is detected for the same batch and index, a `SyncError` is returned to surface operator attention
-- Code reference: [via_verifier/node/via_btc_watch/src/message_processors/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_btc_watch/src/message_processors/withdrawal.rs)
-- Effect: Enables idempotent post-broadcast reconciliation when BTC Watch sees the withdrawal inscription, independent of who broadcast the transaction
-- When present, index_withdrawal (i64 LE) is parsed from OP_RETURN and attached to BridgeWithdrawalInput; default 0 when absent. See [MessageParser](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs#L800) and [BridgeWithdrawalInput.index_withdrawal](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/types.rs#L57).
+- References: weight constants and estimation in `via_verifier/lib/via_musig2/src/constants.rs` and `transaction_builder.rs`; withdrawal persistence in `via_verifier/lib/verifier_dal/src/withdrawals_dal.rs`; chunking tests in `via_verifier/lib/via_musig2/src/test/`
+
+### 3.5 Withdrawal intake from Bitcoin (BTC Watch)
+
+When any verifier's BTC Watch sees an executed bridge withdrawal on Bitcoin (a `VIA_WI` OP_RETURN spend from the bridge), the `WithdrawalProcessor` reconciles it idempotently, independent of who broadcast it:
+
+```rust
+// via_verifier/node/via_btc_watch/src/message_processors/withdrawal.rs
+if let FullInscriptionMessage::BridgeWithdrawal(withdrawal_msg) = msg {
+    let tx_id = withdrawal_msg.common.tx_id.as_byte_array().to_vec();
+    let withdrawals = get_withdrawal_requests(withdrawal_msg.input.withdrawals);
+
+    let id_opt = storage
+        .via_withdrawal_dal()
+        .get_bridge_withdrawal_id(&tx_id)
+        .await?;
+
+    let mut transaction = storage.start_transaction().await?;
+
+    let id = match id_opt {
+        Some(id) => id,
+        None => {
+            transaction
+                .via_withdrawal_dal()
+                .insert_bridge_withdrawal_tx(&tx_id)
+                .await?
+        }
+    };
+
+    transaction
+        .via_withdrawal_dal()
+        .mark_bridge_withdrawal_tx_as_processed(&tx_id)
+        .await?;
+
+    transaction
+        .via_withdrawal_dal()
+        .insert_withdrawals(&withdrawals)
+        .await?;
+
+    transaction
+        .via_withdrawal_dal()
+        .mark_withdrawals_as_processed(id, &withdrawals)
+        .await?;
+
+    transaction.commit().await?;
+
+    METRICS.withdrawal_confirmed.inc();
+}
+```
+
+The withdrawal set comes from the parsed `BridgeWithdrawalInput.withdrawals` (recovered from the transaction's outputs and OP_RETURN ids), so a non-coordinator verifier that never saw the signing session still converges to the same processed-withdrawals state.
 
 ## 4. Bitcoin Transaction Structure
 
@@ -499,32 +571,13 @@ The final Bitcoin withdrawal transaction has the following structure:
 
 ### 4.2 Outputs
 
-1. Withdrawal Outputs: One output for each unique recipient address, with the total amount for that address
-2. OP_RETURN Output: Contains the prefix "VIA_PROTOCOL:WITHDRAWAL:" followed by the proof transaction ID
+1. Withdrawal Outputs: One output per withdrawal in this transaction
+2. OP_RETURN Output: `VIA_WI` prefix, a 1-byte `WithdrawalVersion`, then the ids of the withdrawals paid by this transaction
 3. Change Output (optional): Returns any excess funds back to the bridge address
 
 ### 4.3 Witness Structure
 
-The witness for each input consists of a single item:
-- The aggregated MuSig2 signature with the SIGHASH_ALL flag appended
-
-```rust
-// via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs
-fn sign_transaction(
-    &self,
-    unsigned_tx: UnsignedBridgeTx,
-    musig2_signature: CompactSignature,
-) -> String {
-    let mut unsigned_tx = unsigned_tx;
-    let mut final_sig_with_hashtype = musig2_signature.serialize().to_vec();
-    let sighash_type = TapSighashType::All;
-    final_sig_with_hashtype.push(sighash_type as u8);
-    for tx in &mut unsigned_tx.tx.input {
-        tx.witness = Witness::from(vec![final_sig_with_hashtype.clone()]);
-    }
-    bitcoin::consensus::encode::serialize_hex(&unsigned_tx.tx)
-}
-```
+The witness for each input consists of a single item: **that input's** aggregated MuSig2 signature with the SIGHASH_ALL flag appended. Each input carries a different signature, produced by its own signing session over its own sighash (see `sign_transaction` in section 3.4).
 
 ## 5. Required Proofs and Verification
 
@@ -582,12 +635,12 @@ The withdrawal finalization process is coordinated by the Verifier Network:
 
 - Withdrawals are only processed if they come from finalized L2 batches
 - Batch finalization requires ZK proof verification and verifier attestations
-- The OP_RETURN output in the withdrawal transaction references the proof transaction
+- The OP_RETURN output ties each Bitcoin output to a specific L2 withdrawal id, making the payment set independently checkable
 
 ### 7.3 Transaction Validation
 
 - The withdrawal transaction is verified to ensure it correctly includes all withdrawals
-- The OP_RETURN output is verified to contain the correct proof transaction ID
+- Every verifier recomputes the per-input sighashes and checks the fee rate is within ±1 sat/vbyte of its own estimate before signing
 - The transaction is signed using the MuSig2 protocol with the SIGHASH_ALL flag
 
 ### 7.4 Fee-Aware Validation Enhancements
