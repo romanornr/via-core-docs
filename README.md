@@ -48,7 +48,7 @@ A distributed verifier network independently validates ZK proofs against the dat
 
 Security and trust assumptions are explicit. L2 correctness relies on the soundness of the validity proofs and on data availability from Celestia; clients can verify proofs and sample DA independently. Economic finality of the posted commitments inherits Bitcoin’s reorg resistance once inscriptions confirm.
 
-The BTC bridge is trust-minimized via [MuSig2](https://eprint.iacr.org/2020/1261): withdrawals require a threshold of keys that are governed on-chain (via governance inscriptions) and operationally constrained to sign only for finalized, proven exits. 
+The BTC bridge is trust-minimized via [MuSig2](https://eprint.iacr.org/2020/1261): the bridge address is an n-of-n aggregated Taproot key over the verifier set, governed on-chain (via governance inscriptions) and operationally constrained to sign only for finalized, proven exits. 
 
 This approach avoids merged mining and is secured by Bitcoin by anchoring zk-verified batch roots and governance messages on L1, minimizing on-chain footprint, and achieving low fees and high throughput through off-chain execution and data, with validity proofs ensuring correctness.
 
@@ -62,11 +62,11 @@ Celestia provides data availability, while Bitcoin serves as the commitment and 
 
 Security and trust assumptions are explicit. L2 correctness depends on the soundness of the validity proofs and the availability of batch data on Celestia; clients can verify proofs and independently sample or audit DA. Once inscriptions confirm, the economic finality of posted commitments inherits Bitcoin’s reorg resistance.
 
-BTC custody is secured through a MuSig2 threshold signer set, with keys and policies defined by on-chain inscriptions. This ensures that custody rules are transparent, auditable, and upgradeable without trusting any single party. Operators are cryptographically constrained to sign only for finalized, validity-proven exits, which eliminates arbitrary withdrawals and protects user funds.
+BTC custody is secured through a MuSig2 signer set (n-of-n key aggregation over the verifier network), with keys and policies defined by on-chain inscriptions. This ensures that custody rules are transparent, auditable, and upgradeable without trusting any single party. Operators are cryptographically constrained to sign only for finalized, validity-proven exits, which eliminates arbitrary withdrawals and protects user funds.
 
 Via is a sovereign rollup anchored by commitments. Via is not AuxPoW, merged mining, or a sidechain like Rootstock, Botanix Spiderchain, or Tether Plasma XPL. Sidechains depend on external guardian or validator sets, often using rotating threshold multisigs, which do not enforce state correctness or withdrawals in their L1 checkpoints.
 
-In contrast to these sidechains, Via's custody and exits are enforced by posted commitments and ZK validity proofs, with a MuSig2 threshold signer set bound by on‑chain policies.
+In contrast to these sidechains, Via's custody and exits are enforced by posted commitments and ZK validity proofs, with a MuSig2 n-of-n signer set bound by on-chain policies.
 
 ## Why Choose Via?
 
@@ -211,13 +211,13 @@ This README serves as the main entry point to all documentation. Documents are o
 - [**RPC API Layer**](rpc_api_layer.md) 🟡 ⏱️ 15 min
   API interfaces for interacting with the Via L2 system.
 - [**External Node**](external_node.md) 🟡 ⏱️ 25 min
-  Read replica that syncs from the main node and serves API requests independently. It can optionally run the BTC Watch in follower mode (governance execution processing disabled) using [via_bridge], [via_btc_client], [via_btc_watch] blocks; see [external_node.md](external_node.md).
+  Read replica that syncs from the main node over JSON-RPC and serves API requests independently. It runs the BTC Watch in follower mode (governance upgrade processing disabled) and a mandatory Bitcoin-based reorg detector; see [external_node.md](external_node.md).
 
 ### ⚙️ Configuration and Operations
 
 - [**Configuration**](configuration.md) 🟢 ⏱️ 20 min
   Overview of configuration files, environment variables, and parameters.
-  Note: Bridge configuration is split into a dedicated section. The API resolves the active bridge address from the DB (SystemWallets), and deposit helpers require an explicit --bridge-address. See [configuration.md](configuration.md).
+  Note: the active bridge address is bootstrapped on-chain and persisted as SystemWallets; static config carries it via `VIA_BRIDGE_BRIDGE_ADDRESS`, and deposit helpers require an explicit --bridge-address. See [configuration.md](configuration.md).
 
 - [**Fee Mechanism**](fee_mechanism.md) 🟢 ⏱️ 15 min  
   How transaction fees are calculated and processed.
@@ -282,57 +282,19 @@ If you encounter issues or have questions while working with the Via L2 system, 
 - Diagrams are created using Mermaid syntax for consistency and maintainability.
 - Technical terms are defined when first introduced and collected in a glossary.
 
-## 🔄 Recent Updates
+## ✅ Verification Status
 
-This documentation has been updated to reflect the latest changes in the Via L2 system, including:
+Every document in this repository has been verified line by line against the via-core source tree at commit `e383a2990`. Fabricated or stale content (invented CLIs, env vars, structs, SQL tables, and RPC methods from earlier auto-generated revisions) has been removed and replaced with verbatim code copied from the source, each block headed by its file path. See [VERIFICATION.md](VERIFICATION.md) for the per-file ledger: what was wrong in each document and what it was replaced with.
 
-### Enhanced Configuration Support
-- **Wallet Address Configuration**: New wallet address fields for verifier and BTC sender components
-- **Fee Rate Limits**: Network-specific fee rate limits for Bitcoin transactions (Mainnet, Testnet, Regtest)
-- **Server Component Selection**: Selective component execution via `--components` CLI flag
-- **Enhanced Genesis Configuration**: Updated genesis values and l2_chain_id usage
+If you spot a claim that disagrees with via-core at a newer commit, trust the code and please open an issue or PR.
 
-### Improved Fee Management
-- **External API Fallback**: Bitcoin client fallback to external APIs for fee rate estimation
-- **Mempool Integration**: Enhanced fee calculation using mempool data via `get_mempool_info()` method
-- **Network-Aware Fee Strategies**: Dynamic fee adjustment based on network conditions
-
-### Enhanced API and RPC Layer
-- **Wallet-Specific RPC URLs**: Support for Bitcoin RPC URLs with wallet-specific paths
-- **Coordinator API Validation**: Stricter cryptographic validation for partial signature submissions
-- **Database Query Improvements**: Enhanced L1 batch details queries for better data availability
-
-### Advanced Verifier Features
-- **Synchronization Improvements**: Enhanced verifier synchronization with L1 pause mechanism
-- **MuSig2 Enhancements**: New partial signature verification utilities and examples
-- **Multi-Client Support**: Multiple Bitcoin client instances for different operational roles
-
-### Bridge Enhancements
-- **Enhanced Deposit Validation**: Stricter L2 receiver address validation and minimum deposit requirements
-- **Simplified Transaction Creation**: Standardized empty calldata for deposit transactions
-- **Testnet Bootstrap Support**: Comprehensive testnet configuration and bootstrap transaction IDs
-
-### External Node
-- Added External Node component: read-replica that syncs from the main validator node and serves API requests independently. See [external_node.md](external_node.md).
-
-### New Examples and Utilities
-- **ZK Proof Verification**: Complete examples for verifying ZK proofs from Data Availability
-- **Fee Rate Management**: Advanced fee estimation examples with multiple strategies
-- **MuSig2 Operations**: Partial signature verification and session management examples
-- **Development Tools**: Testnet bootstrapping utilities and selective component execution
-
-- Bridge config & API
-  Active bridge address is resolved from DB (SystemWallets) by via_getBridgeAddress; deposit helpers now require --bridge-address. See [configuration.md](configuration.md).
-
-- System wallet governance flows & CLI
-  Sequencer/Governance/Bridge updates use proposal (witness) + execution (OP_RETURN). Multisig subcommands cover upgrade and wallet updates. See [inscription_interaction.md](inscription_interaction.md), [/docs/via_guides/upgrade.md](https://github.com/vianetwork/via-core/blob/main/docs/via_guides/upgrade.md), [/docs/via_guides/musig2.md](https://github.com/vianetwork/via-core/blob/main/docs/via_guides/musig2.md).
-
-- Watchers
-  Canonical chain gating, duplicate proof‑reveal checks, and wallet‑update reprocessing documented in [verifier.md](verifier.md) and [l1_watcher.md](l1_watcher.md).
-
-- External Node
-  Optional BTC Watch follower mode with [via_bridge], [via_btc_client], [via_btc_watch] blocks; template keys in [external_node.md](external_node.md).
+Highlights of what verification corrected across the set:
+- **Governance and upgrades** are two-phase: a `SystemContractUpgradeProposal` inscription, then a governance-signed `VIA_PROTOCOL:UPGRADE` OP_RETURN referencing the proposal txid. System wallets (sequencer, governance, bridge, verifiers) rotate at runtime through the same mechanism. See [system_upgrade_process.md](system_upgrade_process.md) and [inscription_interaction.md](inscription_interaction.md).
+- **The bridge is n-of-n MuSig2 with per-input signing**; withdrawal sessions are DAL-driven with an OP_RETURN carrying L2 withdrawal ids (`VIA_WI` prefix). See [withdrawal_finalization.md](withdrawal_finalization.md) and [musig2_implementation.md](musig2_implementation.md).
+- **The `via` web3 namespace has exactly two active methods** (`via_getBitcoinNetwork`, `via_getDaBlobData`); the coordinator is a separate authenticated REST service. See [rpc_api_layer.md](rpc_api_layer.md).
+- **Deposits carry deterministic priority ids** (bit-packed block/tx-index/vout), which is why Via forks the mempool crate (`via_mempool`, BTreeMap-ordered). See [mempool.md](mempool.md) and [l1_watcher.md](l1_watcher.md).
+- **Three separate databases** (main node, verifier, indexer) with distinct schemas, documented from their real migrations. See [database_schemas.md](database_schemas.md).
 
 ---
 
-* As of right now, this documentation is maintained by a single person. Last updated: August 19, 2025.*
+*This documentation is maintained by a single person. Last verified against via-core `e383a2990`: July 2, 2026.*

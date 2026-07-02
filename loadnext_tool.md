@@ -2,244 +2,632 @@
 
 ## 1. Introduction
 
-The Via Loadnext tool is a comprehensive load testing utility designed for stress-testing the Via L2 Bitcoin ZK-Rollup protocol. Adapted from the ZKsync loadnext tool, it has been modified to work with Via's Bitcoin integration, enabling thorough testing of the protocol's performance, reliability, and robustness under various conditions.
+Via ships two load-testing crates, both inherited from the ZKsync Era `loadnext` utility:
 
-## 2. Purpose and Functionality
+| Crate | Path | Binary | State |
+|---|---|---|---|
+| `loadnext` | `core/tests/loadnext` | `loadnext` | Unmodified ZKsync Era load tester. Its L1 side talks to an Ethereum web3 RPC (`L1_RPC_ADDRESS`, default `http://127.0.0.1:8545`) and uses ERC-20 minting and Ethereum deposits. Via has no Ethereum L1, so the L1-dependent paths (deposits, L1 execute, final withdrawal) cannot work against a Via deployment. Only the pure L2 transaction paths are meaningful. |
+| `via_loadnext` | `core/tests/via_loadnext` | `via_loadnext` | Via-adapted fork. The Ethereum L1 side is replaced with a Bitcoin regtest client (`via_btc_client`): deposits are real Bitcoin transactions to the bridge address, and withdrawals target Bitcoin addresses. |
 
-The Loadnext tool serves several critical purposes in the Via ecosystem:
+The rest of this document describes `via_loadnext`, the Via-specific fork. A grep for `btc|Bitcoin` in `core/tests/loadnext/src` returns nothing; all Bitcoin integration lives in `core/tests/via_loadnext`.
 
-1. **Performance Testing**: Measures the system's ability to handle high transaction volumes and calculates metrics like transactions per second (TPS)
-2. **Stress Testing**: Pushes the system to its limits by simulating many concurrent users and transactions
-3. **Reliability Testing**: Verifies the system's ability to handle both valid and invalid transactions appropriately
-4. **Integration Testing**: Tests the complete flow from L1 (Bitcoin) to L2 (Via) and back, including deposits and withdrawals
-5. **Regression Testing**: Ensures new protocol changes don't negatively impact performance or functionality
+The `via` CLI wires it up as `via run loadtest`:
 
-## 3. Key Features
+```typescript
+// infrastructure/via/src/run.ts
+export async function loadtest(...args: string[]) {
+    console.log(args);
+    await utils.spawn(`cargo run --release --bin via_loadnext -- ${args.join(' ')}`);
+}
+```
 
-The Loadnext tool offers a robust set of features:
+## 2. Purpose
 
-- **Resilient Operation**: Continues testing even if the server becomes unresponsive
-- **Diverse Operations**: Performs a unique set of operations for each test account
-- **Multi-layer Testing**: Tests both L1-to-L2 and L2-to-L1 operations
-- **Error Simulation**: Deliberately sends incorrect transactions to test error handling
-- **Extensible Architecture**: Provides an easy-to-extend command system for adding new test scenarios
-- **Comprehensive Reporting**: Collects and analyzes detailed performance metrics
+Inherited from upstream loadnext (see `core/tests/via_loadnext/README.md`, which is still the ZKsync README):
 
-## 4. Architecture and Components
+- Simulates many independent accounts sending quasi-random requests to the server.
+- Sends both correct and deliberately corrupted transactions and compares outcomes to expectations.
+- Reports average TPS at the end of the run.
+- Marks the test as failed rather than crashing if the server becomes unresponsive.
 
-### 4.1 Core Components
+## 3. Account Model
 
-The Loadnext tool is structured around several key components:
+Each test account has an Ethereum-style L2 identity plus a Bitcoin identity. Both are generated from the loadtest RNG; the Bitcoin side is hardcoded to regtest:
 
-#### 4.1.1 Account Management
-- `AccountPool`: Manages a collection of test wallets with both L2 and Bitcoin capabilities
-- `TestWallet`: Represents a test user with Ethereum wallet capabilities
-- `BtcAccount`: Represents a Bitcoin account for testing Bitcoin operations
-- `AccountLifespan`: Manages the lifecycle of test accounts during the test, including Bitcoin wallet operations
+```rust
+// core/tests/via_loadnext/src/account_pool.rs
+#[derive(Debug, Clone)]
+pub struct BtcAccount {
+    pub btc_private_key: BitcoinPrivateKey,
+    pub btc_address: BitcoinAddress,
+}
 
-#### 4.1.2 Transaction System
-- `TxCommand`: Represents a transaction to be executed
-- `ApiRequest`: Represents an API request to be made
-- `SubscriptionType`: Represents a subscription to events
-- Various transaction builders for different operation types
+/// Pool of accounts to be used in the test.
+/// Each account is represented as `zksync::Wallet` in order to provide convenient interface of interaction with ZKsync.
+#[derive(Debug)]
+pub struct AccountPool {
+    /// Main wallet that will be used to initialize all the test wallets.
+    pub eth_master_wallet: SyncWallet,
+    /// Main wallet that will be used to initialize all the test wallets.
+    pub btc_master_wallet: BtcAccount,
+    /// Collection of test wallets and their Ethereum private keys.
+    pub eth_accounts: VecDeque<TestWallet>,
+    /// Collection of test wallets and their Bitcoin private keys.
+    pub btc_accounts: VecDeque<BtcAccount>,
+    /// Pool of addresses of the test accounts.
+    pub addresses: AddressPool,
+}
+```
 
-#### 4.1.3 Reporting and Metrics
-- `ReportBuilder`: Collects and formats test results
-- `MetricsCollector`: Gathers performance metrics
-- `TimeHistogram`: Tracks execution times for different operations
-- `OperationResultsCollector`: Analyzes success/failure rates
+```rust
+// core/tests/via_loadnext/src/account_pool.rs
+pub struct TestWallet {
+    /// Pre-initialized wallet object.
+    pub wallet: SyncWallet,
+    /// Wallet with corrupted signer.
+    pub corrupted_wallet: CorruptedSyncWallet,
+    /// Contract bytecode and calldata to be used for sending `Execute` transactions.
+    pub test_contract: &'static TestContract,
+    /// Address of the deployed contract to be used for sending
+    /// `Execute` transaction.
+    pub deployed_contract_address: Arc<OnceCell<Address>>,
+    /// RNG object derived from a common loadtest seed and the wallet private key.
+    pub rng: LoadtestRng,
+}
+```
 
-#### 4.1.4 Execution Engine
-- `Executor`: Orchestrates the entire test process
-- `RequestLimiters`: Controls concurrency to prevent overwhelming the system
+`AddressPool` holds both address kinds and hands out random targets (`random_evm_address`, `random_btc_address`). Other inherited components: `AccountLifespan` (per-account command loop), `Executor` (orchestration), `RequestLimiters` (semaphores for API requests and PubSub subscriptions), `ReportBuilder`/`ReportCollector` (results), and the vise-based `LOADTEST_METRICS`.
 
-### 4.2 Bitcoin Integration
+## 4. Command Model
 
-The tool includes specialized components for Bitcoin operations:
+### 4.1 Transaction commands
 
-- Bitcoin wallet management with private key handling
-- Bitcoin deposit and withdrawal functionality
-- Bitcoin address handling and validation
-- Bitcoin transaction creation and signing
-- Bitcoin UTXO management
-- Bitcoin fee estimation
+The Via fork trims the upstream `TxType` (which had `Deposit, WithdrawToSelf, WithdrawToOther, DeployContract, L1Execute, L2Execute`) down to four variants, three of which are weighted for random selection:
 
-The Bitcoin integration has been significantly enhanced to support:
+```rust
+// core/tests/via_loadnext/src/command/tx_command.rs
+static WEIGHTS: OnceCell<[(TxType, f32); 3]> = OnceCell::new();
 
-- Direct Bitcoin deposits to L2 via the bridge address
-- Bitcoin withdrawals from L2 to specified Bitcoin addresses
-- Bitcoin transaction monitoring and confirmation tracking
-- Bitcoin wallet balance management
+/// Type of transaction. It doesn't copy the ZKsync operation list, because
+/// it divides some transactions in subcategories (e.g. to new account / to existing account; to self / to other; etc)/
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum TxType {
+    Deposit,
+    Withdraw,
+    DeployContract,
+    L2Execute,
+}
 
-## 5. Workflow
+impl TxType {
+    pub fn initialize_weights(transaction_weights: &TransactionWeights) {
+        WEIGHTS
+            .set([
+                (TxType::Deposit, transaction_weights.deposit),
+                (TxType::L2Execute, transaction_weights.l2_transactions),
+                (TxType::Withdraw, transaction_weights.withdrawal),
+            ])
+            .unwrap();
+    }
+}
+```
 
-The general flow of a Loadnext test is as follows:
+`TxCommand` carries an optional Bitcoin recipient, populated only for withdrawals:
 
-1. **Initialization**:
-   - Bitcoin wallets are created for each test account
-   - The master account performs an initial deposit to L2
-   - The paymaster on L2 is funded if necessary
-   - The L2 master account distributes funds to participating accounts
-   - Bitcoin funds are distributed to test accounts if Bitcoin operations are enabled
+```rust
+// core/tests/via_loadnext/src/command/tx_command.rs
+/// Complete description of a transaction that must be executed by a test wallet.
+#[derive(Debug, Clone)]
+pub struct TxCommand {
+    /// Type of operation.
+    pub command_type: TxType,
+    /// Whether and how transaction should be corrupted.
+    pub modifier: IncorrectnessModifier,
+    /// Recipient address.
+    pub to: Address,
+    pub to_btc: Option<BitcoinAddress>,
+    /// Transaction amount (0 if not applicable).
+    pub amount: U256,
+}
+```
 
-2. **Test Execution**:
-   - Each account continuously sends transactions as configured
-   - Transactions can include L2 operations, Bitcoin deposits, and Bitcoin withdrawals
-   - At any given time, there are no more than `max_inflight_txs` transactions in flight for each account
-   - The test runs for the configured duration (`duration_sec`)
+```rust
+// core/tests/via_loadnext/src/command/tx_command.rs (inside new_with_type)
+        if matches!(command.command_type, TxType::Withdraw) {
+            command.to_btc = Some(addresses.random_btc_address(rng));
+        }
 
-3. **Finalization**:
-   - After the test is finished, the master account withdraws remaining funds
-   - Bitcoin balances are consolidated if configured
-   - The average TPS and other metrics are reported
+        // Check whether we should use a self as a target.
+        if command.command_type.is_target_self() {
+            command.to = own_address;
+        }
 
-## 6. Configuration Options
+        // Fix incorrectness modifier:
+        // L1 txs should always have `None` modifier.
+        if matches!(command.command_type, TxType::Deposit) {
+            command.modifier = IncorrectnessModifier::None;
+        }
+```
 
-The Loadnext tool is highly configurable through environment variables:
+There are no `Transfer`, `BtcDeposit`, `BtcWithdraw`, or `BtcTransfer` command types. `Deposit` IS the Bitcoin deposit and `Withdraw` IS the withdrawal to a Bitcoin address.
 
-### 6.1 General Configuration
-- `ACCOUNTS_AMOUNT`: Number of accounts to use in the test
-- `ACCOUNTS_GROUP_SIZE`: Number of accounts sharing a contract address
-- `MAX_INFLIGHT_TXS`: Maximum number of in-flight transactions per account
-- `DURATION_SEC`: Test duration in seconds
-- `SEED`: Random seed for reproducible tests
+### 4.2 Error simulation
 
-### 6.2 Network Configuration
-- `L2_RPC_ADDRESS`: Address of the L2 RPC endpoint
-- `L2_WS_RPC_ADDRESS`: Address of the L2 WebSocket RPC endpoint
-- `L1_BTC_RPC_ADDRESS`: Address of the Bitcoin RPC endpoint
-- `L1_BTC_RPC_USER`: Username for Bitcoin RPC authentication
-- `L1_BTC_RPC_PASSWORD`: Password for Bitcoin RPC authentication
-- `L1_BTC_NETWORK`: Bitcoin network to use (mainnet, testnet, regtest)
-- `L2_CHAIN_ID`: Chain ID of the L2 network
+```rust
+// core/tests/via_loadnext/src/command/tx_command.rs
+pub enum IncorrectnessModifier {
+    ZeroFee,
+    IncorrectSignature,
 
-### 6.3 Contract Execution Parameters
-- `CONTRACT_EXECUTION_PARAMS_READS`: Number of storage reads per transaction
-- `CONTRACT_EXECUTION_PARAMS_WRITES`: Number of storage writes per transaction
-- `CONTRACT_EXECUTION_PARAMS_EVENTS`: Number of events emitted per transaction
-- `CONTRACT_EXECUTION_PARAMS_HASHES`: Number of hash operations per transaction
-- `CONTRACT_EXECUTION_PARAMS_RECURSIVE_CALLS`: Number of recursive calls per transaction
-- `CONTRACT_EXECUTION_PARAMS_DEPLOYS`: Number of contract deployments per transaction
+    // Last option goes for no modifier,
+    // since it's more convenient than dealing with `Option<IncorrectnessModifier>`.
+    None,
+}
+```
 
-### 6.4 Transaction Weights
-- `TRANSACTION_WEIGHTS_DEPOSIT`: Weight for deposit transactions
-- `TRANSACTION_WEIGHTS_WITHDRAWAL`: Weight for withdrawal transactions
-- `TRANSACTION_WEIGHTS_L2_TRANSACTIONS`: Weight for L2 transactions
-- `TRANSACTION_WEIGHTS_BTC_DEPOSIT`: Weight for Bitcoin deposit transactions
-- `TRANSACTION_WEIGHTS_BTC_WITHDRAWAL`: Weight for Bitcoin withdrawal transactions
+Weighting gives roughly 90% probability of no modifier. Expected outcomes:
 
-### 6.5 Bitcoin Configuration
-- `BTC_MASTER_WALLET_PK`: Private key for the Bitcoin master wallet
-- `BTC_ACCOUNTS_AMOUNT`: Number of Bitcoin accounts to use in the test
-- `BTC_MIN_CONFIRMATIONS`: Minimum confirmations required for Bitcoin transactions
-- `BTC_FEE_RATE`: Fee rate for Bitcoin transactions (in satoshis per byte)
-- `BTC_DEPOSIT_AMOUNT`: Amount to deposit in each Bitcoin deposit transaction
-- `BTC_WITHDRAWAL_AMOUNT`: Amount to withdraw in each Bitcoin withdrawal transaction
+```rust
+// core/tests/via_loadnext/src/command/tx_command.rs
+impl IncorrectnessModifier {
+    pub fn expected_outcome(self) -> ExpectedOutcome {
+        match self {
+            Self::None => ExpectedOutcome::TxSucceed,
+            Self::ZeroFee | Self::IncorrectSignature => ExpectedOutcome::ApiRequestFailed,
+        }
+    }
+}
+```
 
-## 7. Example Usage
+### 4.3 API and PubSub commands
 
-To run a load test with parameters similar to mainnet:
+```rust
+// core/tests/via_loadnext/src/command/api.rs
+#[derive(Debug, Copy, Clone)]
+pub enum ApiRequestType {
+    /// Requests block with full transactions list.
+    BlockWithTxs,
+    /// Requests account balance.
+    Balance,
+    /// Requests account-deployed contract events.
+    GetLogs,
+}
+```
+
+```rust
+// core/tests/via_loadnext/src/command/pubsub.rs
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum SubscriptionType {
+    /// Subscribes for new block headers.
+    BlockHeaders,
+    /// Subscribes for new transactions.
+    PendingTransactions,
+    /// Subscribes for new logs.
+    Logs,
+}
+```
+
+## 5. Bitcoin Integration
+
+### 5.1 Deposits (L1 Bitcoin to L2)
+
+`account/btc_deposit.rs` builds and signs a raw regtest Bitcoin transaction with `via_btc_client::client::BitcoinClient`: it selects UTXOs of the depositor, pays the bridge address, and encodes the L2 recipient in an `OP_RETURN` output. The fee is hardcoded to 0.0001 BTC and the network is hardcoded to regtest:
+
+```rust
+// core/tests/via_loadnext/src/account/btc_deposit.rs
+pub async fn deposit(
+    amount: u64,
+    receiver_l2_address: EVMAddress,
+    depositor_private_key: PrivateKey,
+    bridge_musig2_address_str: String,
+    rpc_url: String,
+    rpc_username: String,
+    rpc_password: String,
+) -> Result<bitcoin::Txid> {
+    let secp = Secp256k1::new();
+
+    let amount = Amount::from_sat(amount);
+    let fees = Amount::from_btc(0.0001)?;
+
+    let network = bitcoin::Network::Regtest;
+```
+
+```rust
+// core/tests/via_loadnext/src/account/btc_deposit.rs
+    // OP_RETURN output with L2 address.
+    ...
+        script_pubkey: ScriptBuf::new_op_return(receiver_l2_address.to_fixed_bytes()),
+```
+
+Per-account deposits check the account's L1 BTC balance first and skip (not fail) when it is insufficient:
+
+```rust
+// core/tests/via_loadnext/src/account/tx_command_executor.rs
+    async fn execute_btc_deposit(&self, command: &TxCommand) -> Result<SubmitResult, ClientError> {
+        let btc_balance = self.l1_btc_balances().await?;
+        if btc_balance.is_zero()
+            || btc_balance < command.amount
+            || bitcoin::Amount::from_sat(btc_balance.as_u64())
+                < bitcoin::Amount::from_btc(0.0001).unwrap()
+        {
+            // We don't have either funds in L1 to pay for tx or to deposit.
+            // It's not a problem with the server, thus we mark this operation as skipped.
+            let label = ReportLabel::skipped("No L1 balance");
+            return Ok(SubmitResult::ReportLabel(label));
+        }
+
+        let deposit_response = btc_deposit::deposit(
+            command.amount.as_u64(),
+            command.to,
+            self.btc_wallet.btc_private_key,
+            self.config.bridge_address.clone(),
+            self.config.l1_btc_rpc_address.clone(),
+            self.config.l1_btc_rpc_username.clone(),
+            self.config.l1_btc_rpc_password.clone(),
+        )
+        .await;
+```
+
+### 5.2 Withdrawals (L2 to Bitcoin)
+
+Withdrawals are ordinary L2 transactions built with the SDK's `WithdrawBuilder`, whose recipient type was changed from an Ethereum address to `via_btc_client::types::BitcoinAddress`. Optional paymaster support is gated by `USE_PAYMASTER`:
+
+```rust
+// core/tests/via_loadnext/src/account/tx_command_executor.rs
+    pub(super) async fn build_withdraw(&self, command: &TxCommand) -> Result<L2Tx, ClientError> {
+        let wallet = self.eth_wallet.wallet.clone();
+
+        let mut builder = wallet
+            .start_withdraw()
+            .to(command.to_btc.clone().unwrap())
+            .amount(command.amount);
+
+        let paymaster_approval = if self.config.use_paymaster {
+            Some(get_approval_based_paymaster_input_for_estimation(
+                self.paymaster_address,
+                L2_BASE_TOKEN_ADDRESS,
+                MIN_ALLOWANCE_FOR_PAYMASTER_ESTIMATE.into(),
+            ))
+        } else {
+            None
+        };
+```
+
+The builder's string-address variant also enforces regtest:
+
+```rust
+// core/tests/via_loadnext/src/sdk/operations/withdraw.rs
+    pub fn str_to(mut self, to: impl AsRef<str>) -> Result<Self, ClientError> {
+        let to: BitcoinAddress = BitcoinAddress::from_str(to.as_ref())
+            .map_err(|_| ClientError::IncorrectAddress)?
+            .require_network(Network::Regtest)
+            .map_err(|_| ClientError::IncorrectAddress)?;
+```
+
+### 5.3 Network support
+
+Regtest only. `BitcoinNetwork::Regtest` is hardcoded in `account_pool.rs` (key and address generation), `executor.rs`, `account/tx_command_executor.rs`, `account/btc_deposit.rs`, and `sdk/operations/withdraw.rs`. There is no `L1_BTC_NETWORK` configuration option.
+
+## 6. Workflow
+
+```rust
+// core/tests/via_loadnext/src/executor.rs
+    /// Inner representation of `start` function which returns a `Result`, so it can conveniently use `?`.
+    async fn start_inner(&mut self) -> anyhow::Result<LoadtestResult> {
+        tracing::info!("Initializing accounts");
+        tracing::info!(
+            "Running for MASTER {:?}",
+            self.pool.eth_master_wallet.address()
+        );
+        self.check_btc_balance().await?;
+
+        // Deposit BTC to the master account
+        self.deposit_btc_to_master().await?;
+
+        // Deposit BTC to the paymaster
+        self.deposit_btc_to_paymaster().await?;
+
+        // Distribute BTC on L2 to the accounts
+        self.distribute_btc(self.config.accounts_amount).await?;
+
+        let final_result = self.initial_tests().await?;
+        Ok(final_result)
+    }
+```
+
+Details verified in `executor.rs`:
+
+- `check_btc_balance` requires the BTC master wallet to hold at least `accounts_amount * 0.1 + 1.0` BTC on L1 (the `+ 1.0` is for the paymaster) and records the balance in `LOADTEST_METRICS.master_account_balance`.
+- `deposit_btc_to_master` sends that amount to the bridge address via `btc_deposit::deposit` with the ETH master wallet's address in the OP_RETURN, then sleeps 10 seconds waiting for L2 confirmation.
+- `deposit_btc_to_paymaster` deposits 1 BTC to the address returned by `get_testnet_paymaster()` (panics with "No testnet paymaster is set" if absent).
+- `distribute_btc` transfers `100_000_000_000_000_000` (0.1 of the 18-decimal L2 base token) per account on L2 using `L2_BASE_TOKEN_ADDRESS` transfers from the ETH master wallet.
+- Then account lifespans run for `duration_sec` seconds, with at most `max_inflight_txs` unconfirmed transactions per account, and the report collector produces the final `LoadtestResult`.
+
+## 7. Configuration
+
+Configuration is read from environment variables via `envy` (field name uppercased = env var name). The full, real config struct:
+
+```rust
+// core/tests/via_loadnext/src/config.rs
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoadtestConfig {
+    /// Address of the Bitcoin RPC.
+    #[serde(default = "default_l1_btc_rpc_address")]
+    pub l1_btc_rpc_address: String,
+
+    /// Username of the Bitcoin RPC.
+    #[serde(default = "default_l1_btc_rpc_username")]
+    pub l1_btc_rpc_username: String,
+
+    /// Password of the Bitcoin RPC.
+    #[serde(default = "default_l1_btc_rpc_password")]
+    pub l1_btc_rpc_password: String,
+
+    /// Ethereum private key of the wallet that has funds to perform a test.
+    #[serde(default = "default_eth_master_wallet_pk")]
+    pub eth_master_wallet_pk: String,
+
+    /// Bitcoin private key of the wallet that has funds to perform a test.
+    #[serde(default = "default_btc_master_wallet_pk")]
+    pub btc_master_wallet_pk: String,
+
+    /// Amount of accounts to be used in test.
+    /// This option configures the "width" of the test:
+    /// how many concurrent operation flows will be executed.
+    /// The higher the value is, the more load will be put on the node.
+    /// If testing the sequencer throughput, this number must be sufficiently high.
+    #[serde(default = "default_accounts_amount")]
+    pub accounts_amount: usize,
+
+    /// Duration of the test. For proper results, this value should be at least 10 minutes.
+    #[serde(default = "default_duration_sec")]
+    pub duration_sec: u64,
+
+    /// Limits the number of simultaneous API requests being performed at any moment of time.
+    ///
+    /// Setting it to:
+    /// - 0 turns off API requests.
+    /// - `accounts_amount` relieves the limit.
+    #[serde(default = "default_sync_api_requests_limit")]
+    pub sync_api_requests_limit: usize,
+
+    /// Limits the number of simultaneously active PubSub subscriptions at any moment of time.
+    ///
+    /// Setting it to:
+    /// - 0 turns off PubSub subscriptions.
+    #[serde(default = "default_sync_pubsub_subscriptions_limit")]
+    pub sync_pubsub_subscriptions_limit: usize,
+
+    /// Time in seconds for a subscription to be active. Subscription will be closed after that time.
+    #[serde(default = "default_single_subscription_time_secs")]
+    pub single_subscription_time_secs: u64,
+
+    /// Optional seed to be used in the test: normally you don't need to set the seed,
+    /// but you can re-use seed from previous run to reproduce the sequence of operations locally.
+    /// Seed must be represented as a hexadecimal string.
+    ///
+    /// Using the same seed doesn't guarantee reproducibility of API requests: unlike operations, these
+    /// are generated in flight by multiple accounts in parallel.
+    #[serde(default = "default_seed")]
+    pub seed: Option<String>,
+
+    /// Chain id of L2 node.
+    #[serde(default = "default_l2_chain_id")]
+    pub l2_chain_id: u64,
+
+    /// RPC address of L2 node.
+    #[serde(default = "default_l2_rpc_address")]
+    pub l2_rpc_address: String,
+
+    /// WS RPC address of L2 node.
+    #[serde(default = "default_l2_ws_rpc_address")]
+    pub l2_ws_rpc_address: String,
+
+    /// The maximum number of transactions per account that can be sent without waiting for confirmation.
+    /// Should not exceed the corresponding value in the L2 node configuration.
+    #[serde(default = "default_max_inflight_txs")]
+    pub max_inflight_txs: usize,
+
+    /// All of test accounts get split into groups that share the
+    /// deployed contract address. This helps to emulate the behavior of
+    /// sending `Execute` to the same contract and reading its events by
+    /// single a group. This value should be less than or equal to `ACCOUNTS_AMOUNT`.
+    #[serde(default = "default_accounts_group_size")]
+    pub accounts_group_size: usize,
+
+    /// The expected number of the processed transactions during loadtest
+    /// that should be compared to the actual result.
+    /// If the value is `None`, the comparison is not performed.
+    #[serde(default = "default_expected_tx_count")]
+    pub expected_tx_count: Option<usize>,
+
+    /// Label to use for results pushed to Prometheus.
+    #[serde(default = "default_prometheus_label")]
+    pub prometheus_label: String,
+
+    /// Fail the load test immediately if a failure is encountered that would result
+    /// in an eventual test failure anyway (e.g., a failure processing transactions).
+    #[serde(default)]
+    pub fail_fast: bool,
+
+    /// use pay master to pay the transaction fee
+    #[serde(default)]
+    pub use_paymaster: bool,
+
+    /// The via bridge address
+    #[serde(default = "default_bridge_address")]
+    pub bridge_address: String,
+}
+```
+
+```rust
+// core/tests/via_loadnext/src/config.rs
+impl LoadtestConfig {
+    pub fn from_env() -> envy::Result<Self> {
+        envy::from_env()
+    }
+```
+
+### 7.1 Environment variables and defaults
+
+| Env var | Default | Source (config.rs) |
+|---|---|---|
+| `L1_BTC_RPC_ADDRESS` | `http://127.0.0.1:18443` | `default_l1_btc_rpc_address` |
+| `L1_BTC_RPC_USERNAME` | `rpcuser` | `default_l1_btc_rpc_username` |
+| `L1_BTC_RPC_PASSWORD` | `rpcpassword` | `default_l1_btc_rpc_password` |
+| `ETH_MASTER_WALLET_PK` | `7726827caac94a7f9e1b160f7ea819f172f7b6f9d2a97f992c38edeab82d4110` (localhost-only, compromised key) | `default_eth_master_wallet_pk` |
+| `BTC_MASTER_WALLET_PK` | `cVn486kDX5Mr9MimMyiRNMR4ZsKaLbLho3MHZgqVriB5q3S8FKKF` (regtest WIF, address `bcrt1q8tuqv885kehnzucdfskuw6mrhxcj7cjs4gfk5z`) | `default_btc_master_wallet_pk` |
+| `ACCOUNTS_AMOUNT` | `10` | `default_accounts_amount` |
+| `DURATION_SEC` | `60` | `default_duration_sec` |
+| `ACCOUNTS_GROUP_SIZE` | `1` | `default_accounts_group_size` |
+| `MAX_INFLIGHT_TXS` | `5` | `default_max_inflight_txs` |
+| `SYNC_API_REQUESTS_LIMIT` | `20` | `default_sync_api_requests_limit` |
+| `SYNC_PUBSUB_SUBSCRIPTIONS_LIMIT` | `150` | `default_sync_pubsub_subscriptions_limit` |
+| `SINGLE_SUBSCRIPTION_TIME_SECS` | `30` | `default_single_subscription_time_secs` |
+| `SEED` | none | `default_seed` |
+| `L2_CHAIN_ID` | `L2ChainId::default()` | `default_l2_chain_id` |
+| `L2_RPC_ADDRESS` | `http://127.0.0.1:3050` | `default_l2_rpc_address` |
+| `L2_WS_RPC_ADDRESS` | `ws://127.0.0.1:3051` | `default_l2_ws_rpc_address` |
+| `EXPECTED_TX_COUNT` | none | `default_expected_tx_count` |
+| `PROMETHEUS_LABEL` | `unset` | `default_prometheus_label` |
+| `FAIL_FAST` | `false` | serde default |
+| `USE_PAYMASTER` | `false` | serde default |
+| `BRIDGE_ADDRESS` | `bcrt1p3s7m76wp5seprjy4gdxuxrr8pjgd47q5s8lu9vefxmp0my2p4t9qh6s8kq` | `default_bridge_address` |
+
+Additionally, `main.rs` reads `MISC_LOG_FORMAT`, `MISC_SENTRY_URL`, `CHAIN_ETH_NETWORK`, `CHAIN_ETH_ZKSYNC_NETWORK` for observability, and `PROMETHEUS_`-prefixed variables for the push-gateway exporter:
+
+```rust
+// core/tests/via_loadnext/src/main.rs
+    let config = LoadtestConfig::from_env()
+        .expect("Config parameters should be loaded from env or from default values");
+    let execution_config = ExecutionConfig::from_env();
+    let prometheus_config: Option<PrometheusConfig> = envy::prefixed("PROMETHEUS_").from_env().ok();
+
+    TxType::initialize_weights(&execution_config.transaction_weights);
+```
+
+### 7.2 Transaction weights
+
+Only three weights exist. There are no `l1_transactions`, `btc_deposit`, or `btc_withdrawal` weights:
+
+```rust
+// core/tests/via_loadnext/src/config.rs
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransactionWeights {
+    pub deposit: f32,
+    pub withdrawal: f32,
+    pub l2_transactions: f32,
+}
+
+impl TransactionWeights {
+    pub fn from_env() -> Option<Self> {
+        envy::prefixed("TRANSACTION_WEIGHTS_").from_env().ok()
+    }
+}
+
+impl Default for TransactionWeights {
+    fn default() -> Self {
+        Self {
+            deposit: 0.05,
+            withdrawal: 0.5,
+            l2_transactions: 1.0,
+        }
+    }
+}
+```
+
+So the env vars are `TRANSACTION_WEIGHTS_DEPOSIT`, `TRANSACTION_WEIGHTS_WITHDRAWAL`, and `TRANSACTION_WEIGHTS_L2_TRANSACTIONS`. Note that `envy` deserializes the whole struct at once: if any of the three is missing, all fall back to the defaults.
+
+### 7.3 Contract execution parameters
+
+Read with the `CONTRACT_EXECUTION_PARAMS_` prefix into `zksync_test_contracts::LoadnextContractExecutionParams`:
+
+```rust
+// core/lib/test_contracts (documented in core/tests/via_loadnext/README.md)
+pub struct LoadnextContractExecutionParams {
+    pub reads: usize,
+    pub initial_writes: usize,
+    pub repeated_writes: usize,
+    pub events: usize,
+    pub hashes: usize,
+    pub recursive_calls: usize,
+    pub deploys: usize,
+}
+```
+
+Env vars: `CONTRACT_EXECUTION_PARAMS_READS`, `CONTRACT_EXECUTION_PARAMS_INITIAL_WRITES`, `CONTRACT_EXECUTION_PARAMS_REPEATED_WRITES`, `CONTRACT_EXECUTION_PARAMS_EVENTS`, `CONTRACT_EXECUTION_PARAMS_HASHES`, `CONTRACT_EXECUTION_PARAMS_RECURSIVE_CALLS`, `CONTRACT_EXECUTION_PARAMS_DEPLOYS`. There is no `CONTRACT_EXECUTION_PARAMS_WRITES`; writes are split into initial and repeated.
+
+### 7.4 Request limiters
+
+```rust
+// core/tests/via_loadnext/src/config.rs
+#[derive(Debug)]
+pub struct RequestLimiters {
+    pub api_requests: Semaphore,
+    pub subscriptions: Semaphore,
+}
+
+impl RequestLimiters {
+    pub fn new(config: &LoadtestConfig) -> Self {
+        Self {
+            api_requests: Semaphore::new(config.sync_api_requests_limit),
+            subscriptions: Semaphore::new(config.sync_pubsub_subscriptions_limit),
+        }
+    }
+}
+```
+
+## 8. Running
+
+Prerequisites: a running Via L2 node (default RPC `http://127.0.0.1:3050`), a Bitcoin regtest node (default `http://127.0.0.1:18443` with `rpcuser`/`rpcpassword`), a funded BTC master wallet (at least `accounts_amount * 0.1 + 1.0` BTC), and the correct bridge address.
+
+Via the CLI:
 
 ```bash
-cargo build
+via run loadtest
+```
 
-CONTRACT_EXECUTION_PARAMS_WRITES=2 \
+Or directly with cargo (all variables optional; defaults target the local regtest environment):
+
+```bash
+CONTRACT_EXECUTION_PARAMS_INITIAL_WRITES=2 \
+CONTRACT_EXECUTION_PARAMS_REPEATED_WRITES=2 \
 CONTRACT_EXECUTION_PARAMS_READS=6 \
 CONTRACT_EXECUTION_PARAMS_EVENTS=2 \
 CONTRACT_EXECUTION_PARAMS_HASHES=10 \
 CONTRACT_EXECUTION_PARAMS_RECURSIVE_CALLS=0 \
 CONTRACT_EXECUTION_PARAMS_DEPLOYS=0 \
-ACCOUNTS_AMOUNT=300 \
-ACCOUNTS_GROUP_SIZE=300 \
-MAX_INFLIGHT_TXS=20 \
-RUST_LOG="info,loadnext=debug" \
+ACCOUNTS_AMOUNT=10 \
+ACCOUNTS_GROUP_SIZE=1 \
+MAX_INFLIGHT_TXS=5 \
+RUST_LOG="info,via_loadnext=debug" \
 SYNC_API_REQUESTS_LIMIT=0 \
 SYNC_PUBSUB_SUBSCRIPTIONS_LIMIT=0 \
-TRANSACTION_WEIGHTS_DEPOSIT=0 \
-TRANSACTION_WEIGHTS_WITHDRAWAL=0 \
-TRANSACTION_WEIGHTS_L1_TRANSACTIONS=0 \
+TRANSACTION_WEIGHTS_DEPOSIT=0.05 \
+TRANSACTION_WEIGHTS_WITHDRAWAL=0.5 \
 TRANSACTION_WEIGHTS_L2_TRANSACTIONS=1 \
-TRANSACTION_WEIGHTS_BTC_DEPOSIT=0.1 \
-TRANSACTION_WEIGHTS_BTC_WITHDRAWAL=0.1 \
-DURATION_SEC=1200 \
-MASTER_WALLET_PK="..." \
+DURATION_SEC=600 \
+ETH_MASTER_WALLET_PK="..." \
 BTC_MASTER_WALLET_PK="..." \
-L1_BTC_RPC_USER="rpcuser" \
+L1_BTC_RPC_ADDRESS="http://127.0.0.1:18443" \
+L1_BTC_RPC_USERNAME="rpcuser" \
 L1_BTC_RPC_PASSWORD="rpcpassword" \
-L1_BTC_NETWORK="regtest" \
-cargo run --bin via_loadnext
+BRIDGE_ADDRESS="bcrt1p..." \
+cargo run --release --bin via_loadnext
 ```
 
-## 8. Implementation Details
-
-### 8.1 Transaction Types
-
-The tool supports various transaction types:
-
-- **Transfer**: Sends funds from one L2 account to another
-- **Withdraw**: Withdraws funds from L2 to L1 (Bitcoin)
-- **Deposit**: Deposits funds from L1 (Bitcoin) to L2
-- **DeployContract**: Deploys a test contract to L2
-- **L2Execute**: Executes a function on a deployed contract
-- **BtcDeposit**: Deposits Bitcoin directly to L2 via the bridge address
-- **BtcWithdraw**: Withdraws funds from L2 to a Bitcoin address
-- **BtcTransfer**: Transfers Bitcoin between Bitcoin addresses
-
-### 8.2 API Request Types
-
-The tool can also test various API endpoints:
-
-- **BlockWithTxs**: Retrieves block information with transactions
-- **Balance**: Checks account balances
-- **GetLogs**: Retrieves event logs from contracts
-
-### 8.3 Error Simulation
-
-To test error handling, the tool can deliberately create invalid transactions:
-
-- **ZeroFee**: Creates transactions with zero fee
-- **IncorrectSignature**: Creates transactions with invalid signatures
+The unmodified upstream crate can still be run as `cargo run --bin loadnext` (and is wired to `zk run loadtest` in `infrastructure/zk/src/run.ts`), but its Ethereum L1 paths are not usable against Via.
 
 ## 9. Metrics and Reporting
 
-The tool collects various metrics during testing:
+- Average TPS and per-operation reports come from the inherited `ReportCollector` pipeline (`report_collector/mod.rs` includes a `PrometheusCollector`, "which exposes the ongoing loadtest results to grafana via prometheus").
+- `LOADTEST_METRICS.master_account_balance` records the master BTC balance (in sats) at startup.
+- If `PROMETHEUS_`-prefixed variables are set, `main.rs` starts a Prometheus push-gateway exporter; otherwise it logs "Starting without prometheus exporter".
+- `EXPECTED_TX_COUNT`, when set, is compared against the actual processed transaction count.
 
-- **Transaction Throughput**: Measures transactions per second (TPS)
-- **Response Times**: Tracks how long operations take to complete
-- **Success Rates**: Monitors the percentage of successful operations
-- **Error Distribution**: Analyzes the types of errors encountered
-- **Bitcoin Transaction Metrics**: Tracks Bitcoin-specific metrics like confirmation times and fee rates
+## 10. Known Limitations
 
-These metrics are reported both in the console output and can be exported to Prometheus for visualization.
-
-## 11. Bitcoin-Specific Features
-
-The Via Loadnext tool includes several Bitcoin-specific features:
-
-### 11.1 Bitcoin Wallet Management
-
-- Automatic creation of Bitcoin wallets for test accounts
-- Private key management for Bitcoin transactions
-- UTXO tracking and management
-- Balance monitoring and consolidation
-
-### 11.2 Bitcoin Transaction Types
-
-- **Direct Deposits**: Sends Bitcoin directly to the bridge address with L2 recipient information
-- **L2 Withdrawals**: Initiates withdrawals from L2 to specified Bitcoin addresses
-- **Bitcoin Transfers**: Moves Bitcoin between test accounts for UTXO management
-
-### 11.3 Bitcoin Network Compatibility
-
-The tool supports different Bitcoin networks:
-- **Mainnet**: For production testing
-- **Testnet**: For staging environment testing
-- **Regtest**: For local development testing
-
-Each network has different parameters for fee estimation, confirmation times, and address formats.
-
-## 10. Conclusion
-
-The Via Loadnext tool is an essential component of the Via L2 Bitcoin ZK-Rollup ecosystem, providing comprehensive load testing capabilities to ensure the protocol can handle real-world usage scenarios. By simulating various user behaviors and transaction patterns, it helps identify performance bottlenecks and reliability issues before they affect production systems.
-
-The tool's adaptation from ZKsync to Via represents a significant shift from Ethereum-based operations to Bitcoin-based operations, reflecting the Via protocol's focus on Bitcoin as the L1 layer rather than Ethereum.
+- Bitcoin network is hardcoded to regtest throughout; the tool cannot run against testnet or mainnet without code changes.
+- The deposit fee is hardcoded to 0.0001 BTC in `btc_deposit.rs`.
+- The master deposit flow waits a fixed 10 seconds for L2 confirmation instead of polling.
+- The `README.md` inside `core/tests/via_loadnext` is still the unmodified ZKsync loadnext README; its example invocation (with `MASTER_WALLET_PK`, `MAIN_TOKEN`, `TRANSACTION_WEIGHTS_L1_TRANSACTIONS`, `--bin loadnext`) does not match the Via fork.
+- The paymaster funding step calls `get_testnet_paymaster()` and panics if the node has no testnet paymaster configured.
