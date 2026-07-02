@@ -14,12 +14,11 @@ The bridge leverages Bitcoin's native capabilities along with ZK proofs and MuSi
 The bridge system provides comprehensive functionality for secure and efficient cross-chain operations:
 
 ### Core Capabilities
-- **Advanced L1 Deposit Validation**: Comprehensive validation checks for L2 receiver addresses and minimum deposit amounts
-- **Streamlined L1 Transaction Creation**: Optimized transaction structure with standardized calldata handling for deposits
-- **Multi-Client Bitcoin Integration**: Support for multiple Bitcoin client instances with advanced resource management
-- **Comprehensive Testnet Support**: Full testnet configuration and bootstrapping capabilities
-- **Advanced Wallet Integration**: Wallet-specific Bitcoin RPC URL support for optimized bridge operations
-- **Enhanced Database Operations**: Advanced L1 batch details queries for comprehensive bridge transaction tracking
+- **Deposit validation**: receiver must be above the system-contract address space and the value must cover the fixed L2 transaction cost (`ViaL1Deposit::is_valid_deposit()`)
+- **Deterministic deposit ordering**: priority ids derived from `(block, tx_index, vout)`, stable across replays
+- **Per-input MuSig2 withdrawals**: n-of-n signing with weight-based transaction splitting and fee-rate tolerance checks
+- **Idempotent reconciliation**: executed withdrawals are re-derived from the on-chain transaction by any node
+- **Governance-driven wallet rotation**: bridge/sequencer/governance addresses live in `SystemWallets` and update at runtime via OP_RETURN governance flows
 
 ## Architecture
 
@@ -37,46 +36,12 @@ The bridge consists of several interconnected components:
 
 Deposits are detected by the `BitcoinInscriptionIndexer` which monitors the Bitcoin blockchain for transactions sent to the bridge address. The indexer is implemented in `via_btc_client/src/indexer/mod.rs`.
 
-```rust
-// Extract important transactions from a block
-fn extract_important_transactions(
-    &self,
-    transactions: &[BitcoinTransaction],
-) -> (
-    Option<Vec<BitcoinTransaction>>,
-    Option<Vec<BitcoinTransaction>>,
-) {
-    // ...
-    let bridge_txs: Vec<BitcoinTransaction> = transactions
-        .iter()
-        .filter(|tx| {
-            // Check if bridge address is in outputs (deposit destination)
-            tx.output.iter().any(|output| {
-                let script_pubkey = &output.script_pubkey;
-                script_pubkey == &self.bridge_address.script_pubkey()
-            }) && !tx.output.iter().any(|output| {
-                if output.script_pubkey.is_op_return() {
-                    // Extract OP_RETURN data
-                    if let Some(op_return_data) = output.script_pubkey.as_bytes().get(2..) {
-                        // Return true if it starts with withdrawal prefix (which will be negated)
-                        op_return_data.starts_with(b"VIA_PROTOCOL:WITHDRAWAL")
-                    } else {
-                        false
-                    }
-                } else {
-                    false // Not an OP_RETURN output
-                }
-            })
-        })
-        .cloned()
-        .collect();
-    // ...
-}
-```
+`extract_important_transactions(&block.txdata)` classifies each block's transactions into three groups using the `SystemWallets` addresses: `gov_txs` (paying the governance address), `system_txs` (witness inscriptions from known system addresses), and `bridge_txs` (touching the bridge address). Within `bridge_txs`:
 
-The indexer identifies deposit transactions by checking if:
-1. The transaction has an output to the bridge address
-2. The transaction does not contain an OP_RETURN output with the withdrawal prefix
+1. A transaction **paying** the bridge address without a `VIA_WI` OP_RETURN is a deposit candidate, parsed by `parse_bridge_transaction` (inscription-based or OP_RETURN-based deposit)
+2. A transaction **spending from** the bridge with a `VIA_WI` OP_RETURN is an executed withdrawal (`BridgeWithdrawal`); its origin is validated asynchronously by `is_valid_bridge_withdrawal()`, which fetches the referenced input UTXO and checks its script belongs to the bridge (`core/lib/via_btc_client/src/indexer/mod.rs`)
+
+The indexer attaches `tx_index` and `output_vout` metadata (`TransactionWithMetadata`) to every parsed deposit; this feeds the deterministic priority id described at the end of this document.
 
 ### Deposit Processing
 
@@ -87,41 +52,41 @@ Deposits are processed by the `L1ToL2MessageProcessor` in `via_verifier/node/via
 3. Inserts these transactions into the database for processing by the sequencer
 
 ```rust
-fn create_l1_tx_from_message(
-    &self,
-    tx_id: H256,
-    serial_id: PriorityOpId,
-    msg: &L1ToL2Message,
-) -> Result<L1ToL2Transaction, MessageProcessorError> {
-    let amount = msg.amount.to_sat() as i64;
-    let eth_address_l2 = msg.input.receiver_l2_address;
-    let calldata = msg.input.call_data.clone();
+// core/node/via_btc_watch/src/message_processors/l1_to_l2.rs
+impl L1ToL2MessageProcessor {
+    fn create_l1_tx_from_message(
+        &self,
+        msg: &L1ToL2Message,
+    ) -> Result<Option<L1Tx>, MessageProcessorError> {
+        let deposit = ViaL1Deposit {
+            l2_receiver_address: msg.input.receiver_l2_address,
+            amount: msg.amount.to_sat(),
+            calldata: msg.input.call_data.clone(),
+            l1_block_number: msg.common.block_height as u64,
+            tx_index: msg.common.tx_index.ok_or_else(|| {
+                MessageProcessorError::Internal(anyhow::anyhow!("deposit missing tx_index"))
+            })?,
+            output_vout: msg.common.output_vout.ok_or_else(|| {
+                MessageProcessorError::Internal(anyhow::anyhow!("deposit missing output_vout"))
+            })?,
+        };
 
-    let mantissa = U256::from(10_000_000_000u64); // Eth 18 decimals - BTC 8 decimals
-    let value = U256::from(amount) * mantissa;
-    // ...
-    
-    // Create L1 transaction for L2 processing
-    let mut l1_tx = L1Tx {
-        execute: Execute {
-            contract_address: eth_address_l2,
-            calldata: calldata.clone(),
-            value: U256::zero(),
-            factory_deps: vec![],
-        },
-        common_data: L1TxCommonData {
-            sender: eth_address_l2,
-            serial_id,
-            // ...
-            to_mint: value,
-            refund_recipient: eth_address_l2,
-            eth_block: msg.common.block_height as u64,
-        },
-        received_timestamp_ms: unix_timestamp_ms(),
-    };
-    // ...
+        if let Some(l1_tx) = deposit.l1_tx() {
+            tracing::info!(
+                "Created L1 transaction with serial id {:?} (block {}) with deposit amount {} and tx hash {}",
+                l1_tx.common_data.serial_id,
+                l1_tx.common_data.eth_block,
+                deposit.amount,
+                l1_tx.common_data.canonical_tx_hash,
+            );
+            return Ok(Some(l1_tx));
+        }
+        Ok(None)
+    }
 }
 ```
+
+Note what changed from earlier revisions: no `serial_id` parameter is passed in (the serial id comes from `deposit.priority_id()` inside the `From<ViaL1Deposit> for L1Tx` conversion), missing `tx_index`/`output_vout` metadata is a hard error, and invalid deposits yield `Ok(None)` rather than an error. The satoshi amount is scaled by `10_000_000_000` (8 to 18 decimals) into `to_mint`, and the sender and refund recipient are the L2 receiver.
 
 ### Deposit Types
 
@@ -134,156 +99,52 @@ The system supports two types of deposits:
 
 The deposit validation system implements comprehensive security measures and advanced processing logic:
 
-#### 1. Enhanced L2 Receiver Address Validation
+#### The `ViaL1Deposit` type
 
-The system implements comprehensive L2 receiver address validation through the `ViaL1Deposit::is_valid_deposit()` function:
-
-```rust
-// Enhanced validation with stricter checks
-impl ViaL1Deposit {
-    pub fn is_valid_deposit(&self) -> bool {
-        // Check minimum valid L2 receiver address
-        const MIN_VALID_L2_RECEIVER_ADDRESS: H160 = H160([
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x01, 0x00, 0x01
-        ]);
-        
-        // Validate L2 receiver address is above minimum threshold
-        if self.l2_receiver_address < MIN_VALID_L2_RECEIVER_ADDRESS {
-            return false;
-        }
-        
-        // Additional validation checks
-        self.validate_minimum_deposit_amount() && 
-        self.validate_address_format()
-    }
-    
-    fn validate_minimum_deposit_amount(&self) -> bool {
-        // Minimum deposit amount validation (e.g., 1000 satoshis)
-        const MIN_DEPOSIT_AMOUNT: u64 = 1000;
-        self.amount >= MIN_DEPOSIT_AMOUNT
-    }
-    
-    fn validate_address_format(&self) -> bool {
-        // Ensure address is not zero address or other reserved addresses
-        !self.l2_receiver_address.is_zero()
-    }
-}
-```
-
-**Validation Requirements:**
-- L2 receiver address must be >= `0x0000000000000000000000000000000000010001`
-- Minimum deposit amount must be met (prevents dust attacks)
-- Address format validation (no zero addresses or reserved addresses)
-- Enhanced security checks for system-reserved address ranges
-
-#### 2. Improved Deposit Encapsulation
-
-Deposits are encapsulated in a comprehensive `ViaL1Deposit` struct with validation fields:
+Deposits are encapsulated by `ViaL1Deposit` (`core/lib/types/src/l1/via_l1.rs`):
 
 ```rust
+#[derive(Debug, Clone)]
 pub struct ViaL1Deposit {
     pub l2_receiver_address: Address,
     pub amount: u64,
-    pub calldata: Vec<u8>,           // Now always empty for deposits
-    pub serial_id: PriorityOpId,
+    pub calldata: Vec<u8>,
     pub l1_block_number: u64,
-    pub validation_status: DepositValidationStatus,
-    pub created_at: u64,             // Timestamp for tracking
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum DepositValidationStatus {
-    Pending,
-    Valid,
-    Invalid(String),  // Reason for invalidity
+    pub tx_index: usize,
+    pub output_vout: usize,
 }
 ```
 
-#### 3. Simplified L1 Transaction Creation
+Note there is no serial-id field: the priority id is **derived** from `(l1_block_number, tx_index, output_vout)` by `priority_id()` (see the Deterministic PriorityOpId section below).
 
-L1 deposit transactions use **empty calldata** by default, providing a streamlined transaction structure:
-
-```rust
-fn create_l1_tx_from_deposit(
-    &self,
-    deposit: &ViaL1Deposit,
-) -> Result<L1ToL2Transaction, DepositProcessingError> {
-    // Calldata is now always empty for deposits
-    let calldata = Vec::new();  // Simplified - no longer uses deposit.calldata
-    
-    let mantissa = U256::from(10_000_000_000u64); // BTC to ETH decimal conversion
-    let value = U256::from(deposit.amount) * mantissa;
-    
-    let l1_tx = L1Tx {
-        execute: Execute {
-            contract_address: deposit.l2_receiver_address,
-            calldata,  // Always empty for deposits
-            value: U256::zero(),
-            factory_deps: vec![],
-        },
-        common_data: L1TxCommonData {
-            sender: deposit.l2_receiver_address,
-            serial_id: deposit.serial_id,
-            to_mint: value,
-            refund_recipient: deposit.l2_receiver_address,
-            eth_block: deposit.l1_block_number,
-            // Standardized gas parameters
-            max_fee_per_gas: U256::from(120_000_000u64),
-            gas_limit: U256::from(300_000u64),
-            gas_per_pubdata_limit: REQUIRED_L1_TO_L2_GAS_PER_PUBDATA_BYTE.into(),
-        },
-        received_timestamp_ms: unix_timestamp_ms(),
-    };
-    
-    Ok(L1ToL2Transaction { l1_tx, deposit_info: deposit.clone() })
-}
-```
-
-**Key Features:**
-- **Empty Calldata**: All deposit transactions use empty calldata for consistency
-- **Streamlined Structure**: Optimized transaction creation process
-- **Standardized Parameters**: Fixed gas parameters for predictable behavior
-
-#### 4. Advanced Invalid Deposit Handling
+#### Validation
 
 ```rust
-impl DepositProcessor {
-    pub async fn process_deposits(&mut self, deposits: Vec<ViaL1Deposit>) -> ProcessingResult {
-        let mut valid_deposits = Vec::new();
-        let mut invalid_deposits = Vec::new();
-        
-        for mut deposit in deposits {
-            if deposit.is_valid_deposit() {
-                deposit.validation_status = DepositValidationStatus::Valid;
-                valid_deposits.push(deposit);
-            } else {
-                let reason = self.get_validation_failure_reason(&deposit);
-                deposit.validation_status = DepositValidationStatus::Invalid(reason.clone());
-                invalid_deposits.push(deposit);
-                
-                // Comprehensive logging for invalid deposits
-                tracing::warn!(
-                    "Invalid deposit detected: txid={}, reason={}, amount={}, receiver={}",
-                    deposit.txid,
-                    reason,
-                    deposit.amount,
-                    deposit.l2_receiver_address
-                );
-            }
+impl ViaL1Deposit {
+    pub fn is_valid_deposit(&self) -> bool {
+        if self.l2_receiver_address <= H160::from_str(MAX_SYSTEM_CONTRACT_ADDRESS).unwrap() {
+            return false;
         }
-        
-        // Process valid deposits
-        self.create_l1_transactions(valid_deposits).await?;
-        
-        // Store invalid deposits for audit trail
-        self.store_invalid_deposits(invalid_deposits).await?;
-        
-        Ok(ProcessingResult::success())
+
+        // CHeck if the amount can cover the transaction cost.
+        let gas_fee = U256::from(GAS_LIMIT) * U256::from(MAX_FEE_PER_GAS);
+        self.value() >= gas_fee
+    }
+
+    pub fn l1_tx(&self) -> Option<L1Tx> {
+        if !self.is_valid_deposit() {
+            return None;
+        }
+        Some(L1Tx::from(self.clone()))
     }
 }
 ```
+
+Two real checks, not a validation-status machine:
+- The receiver must be **above the system-contract address space** (`MAX_SYSTEM_CONTRACT_ADDRESS`), so deposits cannot mint into kernel addresses
+- The deposited value (satoshis scaled to 18 decimals) must **cover the fixed L2 transaction cost** (`GAS_LIMIT * MAX_FEE_PER_GAS`); dust deposits that could not pay for their own L2 inclusion are dropped
+
+Invalid deposits simply yield `None` from `l1_tx()`; the message processor logs and skips them. The L1→L2 transaction is built by the `From<ViaL1Deposit> for L1Tx` conversion with the fixed gas parameters, and for plain bridging deposits the calldata is empty (the whole amount is minted to the receiver).
 
 ## Withdrawal Flow (L2→L1)
 
@@ -334,90 +195,126 @@ pub async fn is_session_timeout(&self) -> bool {
 session_timeout = 30  # Session timeout in seconds
 ```
 
-3. **Withdrawal Session Creation**: The `WithdrawalSession` in `via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs` creates a withdrawal session for processing.
+3. **Withdrawal Session Creation**: The `WithdrawalSession` (`via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs`) pulls unprocessed withdrawals directly from the withdrawal DAL and builds the unsigned transaction in one step:
 
 ```rust
 async fn session(&self) -> anyhow::Result<Option<SessionOperation>> {
-    // Get the l1 batches finalized but withdrawals not yet processed
-    let l1_batches = self
+    let mut storage = self
         .master_connection_pool
-        .connection_tagged("withdrawal session")
-        .await?
-        .via_votes_dal()
-        .list_finalized_blocks_and_non_processed_withdrawals()
+        .connection_tagged("verifier task")
         .await?;
-    
-    // ...
-    
-    // Create unsigned transaction for withdrawals
-    let unsigned_tx = self
-        .create_unsigned_tx(withdrawals_to_process, proof_txid)
+
+    // Set the minimum amount to withdraw + fee = 660 sats.
+    let min_value = 660;
+
+    let no_processed_withdrawals = storage
+        .via_withdrawal_dal()
+        .list_no_processed_withdrawals(min_value, WITHDRAWAL_LIMIT)
         .await?;
-    
-    // ...
+
+    if no_processed_withdrawals.is_empty() {
+        return Ok(None);
+    }
+
+    let mut outputs = vec![];
+    for w in no_processed_withdrawals {
+        let mut op_return_data = Vec::new();
+        op_return_data.extend_from_slice(&hex::decode(w.id)?);
+
+        outputs.push(TransactionOutput {
+            output: TxOut {
+                value: w.amount,
+                script_pubkey: w.receiver.script_pubkey(),
+            },
+            op_return_data: Some(op_return_data),
+        });
+    }
+
+    let mut op_return_prefix = Vec::new();
+    op_return_prefix.extend_from_slice(OP_RETURN_WITHDRAW_PREFIX);
+    op_return_prefix.push(WITHDRAWAL_VERSION as u8);
+
+    let config = TransactionBuilderConfig {
+        fee_strategy: Arc::new(WithdrawalFeeStrategy::new()),
+        max_tx_weight: MAX_STANDARD_TX_WEIGHT as u64,
+        max_output_per_tx: WITHDRAWAL_LIMIT as usize,
+        op_return_prefix,
+        bridge_address: self.get_system_wallets().await?.bridge,
+        default_fee_rate_opt: None,
+        default_available_utxos_opt: None,
+        op_return_data_input_opt: None,
+    };
+
+    let unsigned_txs = self
+        .transaction_builder
+        .build_transaction_with_op_return(outputs, config)
+        .await?;
+
+    if unsigned_txs.is_empty() {
+        return Ok(None);
+    }
+
+    let sig_hashes = self
+        .transaction_builder
+        .get_tr_sighashes(&unsigned_txs[0])?;
+
+    Ok(Some(SessionOperation::Withdrawal(
+        unsigned_txs[0].clone(),
+        sig_hashes,
+    )))
 }
 ```
 
-3. **Transaction Building**: The `TransactionBuilder` in `via_verifier/lib/via_musig2/src/transaction_builder.rs` creates the Bitcoin transaction for the withdrawal.
+4. **Transaction Building**: `build_transaction_with_op_return(outputs, config)` returns `Vec<UnsignedBridgeTx>`, splitting by weight and output count:
 
 ```rust
+// via_verifier/lib/via_musig2/src/transaction_builder.rs
 pub async fn build_transaction_with_op_return(
     &self,
-    outputs: Vec<TxOut>,
-    op_return_prefix: &[u8],
-    op_return_data: Vec<&Vec<u8>>,
-    fee_strategy: Arc<dyn FeeStrategy>,
-    change_output: Option<TxOut>,
-    max_outputs_per_tx: Option<usize>,
-    weight_limit: u64,
-) -> anyhow::Result<Vec<UnsignedBridgeTx>> {
-    // ...
-    // Create OP_RETURN output script from prefix and data
-    let op_return_script =
-        TransactionBuilder::create_op_return_script(op_return_prefix, op_return_data)?;
+    outputs: Vec<TransactionOutput>,
+    config: TransactionBuilderConfig,
+) -> Result<Vec<UnsignedBridgeTx>> {
+    self.utxo_manager.sync_context_with_blockchain().await?;
 
-    let op_return_output = TxOut {
-        value: Amount::ZERO,
-        script_pubkey: op_return_script,
-    };
-    // ...
+    let available_utxos = self.get_available_utxos(&config).await?;
+    let fee_rate = self.get_fee_rate(&config).await?;
+
+    self.build_bridge_txs(available_utxos, outputs, config, fee_rate)
+        .await
 }
 ```
 
-4. **Multi-Signature Coordination**: The `ViaWithdrawalVerifier` in `via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs` coordinates the MuSig2 signing process among verifiers.
+Full internals (chunking, fee distribution, `UnsignedBridgeTx` fields) in `musig2_implementation.md`.
+
+5. **Multi-Signature Coordination**: The `ViaWithdrawalVerifier` coordinates one MuSig2 session **per transaction input** (`signer_per_utxo_input`); aggregation fills `final_sig_per_utxo_input`, and each input gets its own aggregated Schnorr signature in its witness:
 
 ```rust
-async fn build_and_broadcast_final_transaction(
-    &mut self,
-    session_info: &SigningSessionResponse,
-    session_op: &SessionOperation,
-) -> anyhow::Result<bool> {
-    // ...
-    
-    // Create final signature
-    self.create_final_signature(message)
-        .await?;
-
-    // Sign and broadcast transaction
-    let signed_tx = self.sign_transaction(unsigned_tx.clone(), musig2_signature);
-    let txid = self
-        .btc_client
-        .broadcast_signed_transaction(&signed_tx)
-        .await?;
-    
-    // ...
+// via_verifier/node/via_verifier_coordinator/src/verifier/mod.rs
+fn sign_transaction(&self, unsigned_tx: UnsignedBridgeTx) -> String {
+    let mut unsigned_tx = unsigned_tx;
+    let sighash_type = TapSighashType::All;
+    for (input_index, musig2_signature) in self.final_sig_per_utxo_input.clone() {
+        let mut final_sig_with_hashtype = musig2_signature.serialize().to_vec();
+        final_sig_with_hashtype.push(sighash_type as u8);
+        unsigned_tx.tx.input[input_index].witness =
+            Witness::from(vec![final_sig_with_hashtype.clone()]);
+    }
+    bitcoin::consensus::encode::serialize_hex(&unsigned_tx.tx)
 }
 ```
 
-5. **Transaction Broadcasting**: Once enough verifiers have signed, the coordinator broadcasts the transaction to the Bitcoin network.
+The full nonce/partial-signature round code is in `withdrawal_finalization.md` and `musig2_implementation.md`.
+
+6. **Transaction Broadcasting**: Once every verifier has contributed partial signatures for all inputs, the coordinator broadcasts the transaction to the Bitcoin network and marks the paid withdrawals processed in the same database transaction (`after_broadcast_final_transaction`, verbatim in `withdrawal_finalization.md`).
 
 ### Withdrawal Security
 
 Withdrawals are secured through several mechanisms:
 
 1. **ZK Proofs**: Each L2 batch is verified with a ZK proof, ensuring the validity of all operations including withdrawals.
-2. **MuSig2 Multi-Signatures**: Withdrawals require signatures from a threshold of verifiers using MuSig2.
-3. **Verifier Voting**: Verifiers vote on the validity of L2 batches before processing withdrawals.
+2. **MuSig2 Multi-Signatures**: Withdrawals require signatures from **every** verifier (n-of-n; `required_signers = verifiers_pub_keys.len()`), not a threshold.
+3. **Verifier Voting**: Batches finalize at 2/3 of attestations (`BATCH_FINALIZATION_THRESHOLD = 0.66`) before their withdrawals become signable.
+4. **Independent Re-verification**: Every verifier recomputes the per-input sighashes and enforces the ±1 sat/vB fee-rate tolerance before contributing a partial signature.
 
 ## Bridge Address Management
 
@@ -448,202 +345,48 @@ fn process_bootstrap_message(
 }
 ```
 
-## Bitcoin Client Resource Layer Integration
+## Bitcoin Client Layer
 
-The bridge supports enhanced Bitcoin client resource management with multiple client instances for improved reliability and performance:
-
-### Multiple Bitcoin Client Support
+There is no multi-client manager or connection pool; the node registers a single `BtcClientLayer` providing the Bitcoin client resource to all components:
 
 ```rust
-pub struct BridgeBitcoinClientManager {
-    sender_client: Arc<BitcoinClient>,
-    verifier_client: Arc<BitcoinClient>,
-    bridge_client: Arc<BitcoinClient>,
-    resource_pool: BitcoinClientResourcePool,
-}
-
-impl BridgeBitcoinClientManager {
-    pub fn new(config: &BridgeConfig) -> Result<Self, BridgeError> {
-        Ok(Self {
-            sender_client: Arc::new(BitcoinClient::new(&config.sender_rpc_url)?),
-            verifier_client: Arc::new(BitcoinClient::new(&config.verifier_rpc_url)?),
-            bridge_client: Arc::new(BitcoinClient::new(&config.bridge_rpc_url)?),
-            resource_pool: BitcoinClientResourcePool::new(config.max_connections),
-        })
-    }
-    
-    pub async fn get_client_for_operation(&self, operation: BridgeOperation) -> Arc<BitcoinClient> {
-        match operation {
-            BridgeOperation::SendTransaction => self.sender_client.clone(),
-            BridgeOperation::VerifyTransaction => self.verifier_client.clone(),
-            BridgeOperation::BridgeMonitoring => self.bridge_client.clone(),
-        }
-    }
+// via_verifier/bin/verifier_server/src/node_builder.rs
+fn add_btc_client_layer(mut self) -> anyhow::Result<Self> {
+    self.node.add_layer(BtcClientLayer::new(
+        self.configs.via_btc_client_config.clone(),
+        self.configs.secrets.via_l1.clone().unwrap(),
+        self.configs.wallets.clone(),
+        Some(self.configs.via_bridge_config.bridge_address.clone()),
+    ));
+    Ok(self)
 }
 ```
 
-### Enhanced Resource Management
+Role separation happens through the wallet set (`SystemWallets`: sequencer, governance, bridge, verifiers), not through separate client instances.
+
+## Bootstrapping and Wallets
+
+There is no dedicated testnet JSON bundle or `TestnetBridgeConfig`; bootstrapping is uniform across networks. The wallet set is a single shared type:
 
 ```rust
-pub struct BitcoinClientResourcePool {
-    connections: Arc<Mutex<Vec<BitcoinClientConnection>>>,
-    max_connections: usize,
-    active_connections: AtomicUsize,
-}
-
-impl BitcoinClientResourcePool {
-    pub async fn acquire_connection(&self) -> Result<BitcoinClientConnection, ResourceError> {
-        let mut connections = self.connections.lock().await;
-        
-        if let Some(connection) = connections.pop() {
-            Ok(connection)
-        } else if self.active_connections.load(Ordering::Relaxed) < self.max_connections {
-            self.create_new_connection().await
-        } else {
-            Err(ResourceError::NoAvailableConnections)
-        }
-    }
-    
-    pub async fn release_connection(&self, connection: BitcoinClientConnection) {
-        let mut connections = self.connections.lock().await;
-        connections.push(connection);
-    }
+// core/lib/types/src/via_wallet.rs
+#[derive(Debug, Clone, PartialEq)]
+pub struct SystemWallets {
+    pub sequencer: Address,
+    pub verifiers: Vec<Address>,
+    pub governance: Address,
+    pub bridge: Address,
 }
 ```
 
-### Separation of Concerns
+The flow:
 
-The bridge clearly separates different operational roles:
+- The genesis configuration provides `bootstrap_txids` (the Bitcoin transactions carrying the `SystemBootstrapping` inscription and related setup)
+- At storage initialization, `ViaBootstrap::process_bootstrap_messages()` (`core/lib/via_btc_client/src/bootstrap/mod.rs`) scans those transactions, constructs the `SystemWallets`, and persists them in the `via_wallets` table
+- All downstream components (indexer, watchers, API) read the active addresses from the database at runtime; wallet rotations via governance flow through `BitcoinInscriptionIndexer::update_system_wallets()` so parsing follows the new addresses without config changes
+- The BTC sender validates that its active inscriber address equals `SystemWallets.sequencer` before emitting inscriptions
 
-- **Sender Role**: Handles transaction broadcasting and fee management
-- **Verifier Role**: Manages transaction verification and validation
-- **Bridge Role**: Monitors deposits and withdrawal requests
-
-## Testnet Bootstrapping Support
-
-Enhanced testnet support with dedicated bootstrapping configuration:
-
-### Testnet Configuration Structure
-
-```
-etc/env/via/genesis/testnet/
-├── bootstrap_transactions.json
-├── verifier_keys.json
-├── bridge_config.json
-└── network_params.json
-```
-
-### Bootstrap Transaction IDs
-
-```json
-{
-  "testnet_bootstrap_transactions": {
-    "genesis_tx": "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456",
-    "bridge_init_tx": "b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef1234567a",
-    "verifier_setup_tx": "c3d4e5f6789012345678901234567890abcdef1234567890abcdef1234567ab2"
-  },
-  "confirmation_requirements": {
-    "min_confirmations": 1,
-    "bootstrap_confirmations": 3
-  }
-}
-```
-
-### Testnet Bridge Configuration
-
-```rust
-pub struct TestnetBridgeConfig {
-    pub network: Network,
-    pub bootstrap_txids: Vec<Txid>,
-    pub min_confirmations: u32,
-    pub bridge_address: Address,
-    pub verifier_pubkeys: Vec<PublicKey>,
-    pub development_mode: bool,
-}
-
-impl TestnetBridgeConfig {
-    pub fn load_from_file(path: &Path) -> Result<Self, ConfigError> {
-        let config_data = std::fs::read_to_string(path)?;
-        let config: TestnetBridgeConfig = serde_json::from_str(&config_data)?;
-        
-        // Validate testnet-specific requirements
-        if config.network != Network::Testnet {
-            return Err(ConfigError::InvalidNetwork);
-        }
-        
-        Ok(config)
-    }
-    
-    pub fn is_bootstrap_complete(&self, current_height: u64) -> bool {
-        // Check if all bootstrap transactions are confirmed
-        self.bootstrap_txids.iter().all(|txid| {
-            self.get_transaction_confirmations(txid).unwrap_or(0) >= self.min_confirmations
-        })
-    }
-}
-```
-
-## Enhanced Wallet Integration
-
-The bridge now supports wallet-specific Bitcoin RPC URLs and improved wallet management:
-
-### Wallet-Specific Configuration
-
-```rust
-pub struct WalletBridgeConfig {
-    pub wallet_name: String,
-    pub bitcoin_rpc_url: String,
-    pub wallet_rpc_url: String,  // Wallet-specific RPC endpoint
-    pub utxo_management: UtxoManagementConfig,
-    pub fee_strategy: FeeStrategy,
-}
-
-impl WalletBridgeConfig {
-    pub fn new(wallet_name: String, base_rpc_url: String) -> Self {
-        Self {
-            wallet_rpc_url: format!("{}/wallet/{}", base_rpc_url, wallet_name),
-            wallet_name,
-            bitcoin_rpc_url: base_rpc_url,
-            utxo_management: UtxoManagementConfig::default(),
-            fee_strategy: FeeStrategy::Conservative,
-        }
-    }
-}
-```
-
-### Enhanced UTXO Handling
-
-```rust
-pub struct WalletUtxoManager {
-    wallet_config: WalletBridgeConfig,
-    utxo_cache: Arc<Mutex<HashMap<OutPoint, TxOut>>>,
-    reserved_utxos: Arc<Mutex<HashSet<OutPoint>>>,
-}
-
-impl WalletUtxoManager {
-    pub async fn get_available_utxos(&self) -> Result<Vec<Utxo>, WalletError> {
-        let client = BitcoinClient::new(&self.wallet_config.wallet_rpc_url)?;
-        let utxos = client.list_unspent(None, None, None, None, None).await?;
-        
-        // Filter out reserved UTXOs
-        let reserved = self.reserved_utxos.lock().await;
-        let available_utxos: Vec<Utxo> = utxos
-            .into_iter()
-            .filter(|utxo| !reserved.contains(&utxo.outpoint))
-            .collect();
-            
-        Ok(available_utxos)
-    }
-    
-    pub async fn reserve_utxos(&self, utxos: Vec<OutPoint>) -> Result<(), WalletError> {
-        let mut reserved = self.reserved_utxos.lock().await;
-        for utxo in utxos {
-            reserved.insert(utxo);
-        }
-        Ok(())
-    }
-}
-```
+UTXO handling for the bridge is the `UtxoManager` documented in `utxo_management.md` (pending-transaction context over the node's UTXO set, largest-first selection); there is no separate wallet-RPC UTXO manager.
 
 ### Bridge Withdrawal Validation and Indexing
 
@@ -667,13 +410,9 @@ This release adds a full validation and indexing path for bridge withdrawals on 
 
 - DAL helpers and database persistence
   - Data models for bridge withdrawals:
-- OP_RETURN schema update
-  - BridgeWithdrawal OP_RETURN now supports an optional index_withdrawal (i64 LE).
-  - When present, it is parsed from OP_RETURN and attached to BridgeWithdrawalInput; when absent, it is treated as 0.
-  - Parser and typing references: [MessageParser.parse_withdrawal()](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/parser.rs#L800), [BridgeWithdrawalInput.index_withdrawal](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/types.rs#L57).
-  - Canonical OP_RETURN layout is documented in [inscription_interaction.md](inscription_interaction.md).
-    - [BridgeWithdrawalParam](via_indexer/lib/via_indexer_dal/src/models/withdraw.rs:2)
-    - [WithdrawalParam](via_indexer/lib/via_indexer_dal/src/models/withdraw.rs:13)
+    - [BridgeWithdrawalParam](via_indexer/lib/via_indexer_dal/src/models/withdraw.rs)
+    - [WithdrawalParam](via_indexer/lib/via_indexer_dal/src/models/withdraw.rs)
+  - The OP_RETURN layout is `VIA_WI ++ version byte ++ withdrawals metadata` (no `index_withdrawal` field; withdrawal attribution comes from per-output withdrawal ids). Canonical layout in [inscription_interaction.md](inscription_interaction.md).
   - The DAL exposes a single insertion API that persists the bridge withdrawal row along with all constituent withdrawals:
     - [ViaTransactionsDal::insert_withdraw()](https://github.com/vianetwork/via-core/blob/main/via_indexer/lib/via_indexer_dal/src/via_transactions_dal.rs#L113)
   - Persisted fields include:
@@ -710,234 +449,77 @@ Transferring UTXOs from the old bridge
 - Example utilities:
   - Compute aggregate keys / governance script: [rust compute_musig2.rs](via_verifier/lib/via_musig2/examples/compute_musig2.rs)
   - Transfer UTXOs via governance script path: [rust transfer_utxos_from_bridge.rs](via_verifier/lib/via_musig2/examples/transfer_utxos_from_bridge.rs)
-- Operator runbook and examples are provided in the upgrade guide under “Transfer the UTXOs from the old bridge address”.
+- Operator runbook and examples are provided in the upgrade guide under "Transfer the UTXOs from the old bridge address".
 
-## Database Query Improvements
+## Database Tracking
 
-Enhanced L1 batch details queries for better bridge transaction tracking:
+There is no `bridge_operations` table or `BridgeTransactionTracker`. Bridge state is tracked in two places:
 
-### Improved Batch Queries
+**Verifier side** (`via_verifier/lib/verifier_dal/src/withdrawals_dal.rs`): withdrawals parsed from finalized batches are inserted individually and marked processed once a bridge transaction pays them. The DAL surface:
 
 ```rust
-impl ViaVotesDal<'_, '_> {
-    pub async fn get_l1_batch_details_for_bridge(
-        &mut self,
-        batch_number: L1BatchNumber,
-    ) -> DalResult<Option<L1BatchDetailsForBridge>> {
-        let query = sqlx::query_as!(
-            L1BatchDetailsForBridge,
-            r#"
-            SELECT 
-                l1_batches.number,
-                l1_batches.timestamp,
-                l1_batches.l1_tx_count,
-                l1_batches.l2_tx_count,
-                l1_batches.hash,
-                l1_batches.commitment,
-                l1_batches.compressed_write_logs,
-                l1_batches.compressed_contracts,
-                l1_batches.eth_prove_tx_id,
-                l1_batches.eth_commit_tx_id,
-                l1_batches.eth_execute_tx_id,
-                bridge_operations.deposit_count,
-                bridge_operations.withdrawal_count,
-                bridge_operations.total_deposit_amount,
-                bridge_operations.total_withdrawal_amount
-            FROM l1_batches
-            LEFT JOIN bridge_operations ON l1_batches.number = bridge_operations.l1_batch_number
-            WHERE l1_batches.number = $1
-            "#,
-            batch_number.0 as i64
-        );
-        
-        let result = query.fetch_optional(self.storage.conn()).await?;
-        Ok(result)
-    }
-    
-    pub async fn list_finalized_blocks_and_non_processed_withdrawals_enhanced(
-        &mut self,
-    ) -> DalResult<Vec<L1BatchWithBridgeOperations>> {
-        let query = sqlx::query_as!(
-            L1BatchWithBridgeOperations,
-            r#"
-            SELECT 
-                l1_batches.*,
-                bridge_operations.withdrawal_count,
-                bridge_operations.pending_withdrawals,
-                bridge_operations.processed_withdrawals
-            FROM l1_batches
-            INNER JOIN bridge_operations ON l1_batches.number = bridge_operations.l1_batch_number
-            WHERE l1_batches.is_finished = true
-            AND bridge_operations.withdrawal_count > bridge_operations.processed_withdrawals
-            ORDER BY l1_batches.number ASC
-            "#
-        );
-        
-        let batches = query.fetch_all(self.storage.conn()).await?;
-        Ok(batches)
-    }
+pub async fn insert_l1_batch_bridge_withdrawals(/* ... */)
+pub async fn insert_bridge_withdrawal_tx(&mut self, tx_id: &[u8]) -> DalResult<i64>
+pub async fn mark_bridge_withdrawal_tx_as_processed(&mut self, tx_id: &[u8]) -> DalResult<()>
+pub async fn bridge_withdrawal_exists(&mut self, tx_id: &[u8]) -> DalResult<bool>
+pub async fn get_bridge_withdrawal_id(&mut self, tx_id: &[u8]) -> DalResult<Option<i64>>
+pub async fn insert_withdrawals(/* ... */)
+pub async fn mark_withdrawals_as_processed(/* ... */)
+pub async fn mark_withdrawal_as_processed(/* ... */)
+pub async fn check_if_withdrawal_exists_unprocessed(/* ... */)
+pub async fn check_if_withdrawal_exists(/* ... */)
+```
+
+with the row model:
+
+```rust
+// via_verifier/lib/verifier_dal/src/models/withdrawal.rs
+pub struct Withdrawal {
+    pub l2_tx_hash: String,
+    pub l2_tx_index: i64,
+    pub receiver: String,
+    pub value: i64,
 }
 ```
 
-### Enhanced Data Availability
+The withdrawal session reads `list_no_processed_withdrawals(min_value, limit)` from `via_withdrawal_dal`; post-broadcast reconciliation uses the insert/mark methods above (verbatim flows in `withdrawal_finalization.md`).
 
-```rust
-pub struct BridgeTransactionTracker {
-    pub batch_number: L1BatchNumber,
-    pub deposit_transactions: Vec<DepositTransaction>,
-    pub withdrawal_transactions: Vec<WithdrawalTransaction>,
-    pub processing_status: BatchProcessingStatus,
-    pub confirmation_count: u32,
-}
-
-impl BridgeTransactionTracker {
-    pub async fn track_batch_operations(
-        &self,
-        dal: &mut ViaVotesDal<'_, '_>,
-    ) -> Result<BatchOperationSummary, TrackingError> {
-        let batch_details = dal
-            .get_l1_batch_details_for_bridge(self.batch_number)
-            .await?
-            .ok_or(TrackingError::BatchNotFound)?;
-            
-        let operation_summary = BatchOperationSummary {
-            batch_number: self.batch_number,
-            total_deposits: batch_details.deposit_count,
-            total_withdrawals: batch_details.withdrawal_count,
-            deposit_amount: batch_details.total_deposit_amount,
-            withdrawal_amount: batch_details.total_withdrawal_amount,
-            processing_status: self.processing_status.clone(),
-        };
-        
-        Ok(operation_summary)
-    }
-}
-```
+**Indexer side** (`via_indexer/lib/via_indexer_dal/src/via_transactions_dal.rs`): the standalone L1 indexer persists executed bridge withdrawals via `insert_withdraw(withdrawal: Withdrawal)`, keyed by the L2 withdrawal id, for external API consumption (schema in `l1_indexer.md`).
 
 ## Configuration Examples and Best Practices
 
-### Complete Bridge Configuration
+### The Real Bridge Configuration
 
-```toml
-[bridge]
-# Network configuration
-network = "testnet"  # or "mainnet"
-confirmation_threshold = 6
+The dedicated bridge config is intentionally small (`core/lib/config/src/configs/via_bridge.rs`):
 
-# Bitcoin client configuration
-[bridge.bitcoin_clients]
-sender_rpc_url = "http://localhost:18332"
-verifier_rpc_url = "http://localhost:18333"
-bridge_rpc_url = "http://localhost:18334"
-max_connections = 10
+```rust
+pub struct ViaBridgeConfig {
+    /// The verifiers public keys.
+    pub verifiers_pub_keys: Vec<String>,
 
-# Wallet configuration
-[bridge.wallet]
-wallet_name = "via_bridge_wallet"
-wallet_rpc_url = "http://localhost:18332/wallet/via_bridge_wallet"
-utxo_selection_strategy = "conservative"
-fee_rate_strategy = "medium"
-
-# Bridge address and keys
-[bridge.security]
-bridge_address = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
-verifier_threshold = 3
-total_verifiers = 5
-
-# Deposit validation
-[bridge.deposits]
-min_deposit_amount = 1000  # satoshis
-min_l2_receiver_address = "0x0000000000000000000000000000000000010001"
-max_calldata_size = 0  # Empty calldata for deposits
-
-# Withdrawal configuration
-[bridge.withdrawals]
-batch_size = 10
-max_fee_rate = 50  # sat/vB
-min_output_amount = 546  # dust limit
-
-# Database configuration
-[bridge.database]
-connection_pool_size = 20
-query_timeout_seconds = 30
-batch_query_limit = 100
-
-# Testnet bootstrapping
-[bridge.testnet]
-bootstrap_transactions = [
-    "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef123456",
-    "b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef1234567a"
-]
-development_mode = true
-fast_confirmations = true
+    /// The bridge address.
+    pub bridge_address: String,
+}
 ```
 
-### Production Configuration Example
+Everything else lives in the configs that own it:
+- Bitcoin RPC endpoint, fee APIs: `via_btc_client` (four fields; see `fee_mechanism.md`)
+- Confirmations, poll interval, start block: `via_btc_watch`
+- Session/weight parameters, `bridge_address_merkle_root`: `via_verifier`
+- Deposit validity: code constants in `ViaL1Deposit::is_valid_deposit()` (system-address floor, gas-fee coverage), not config
+- Withdrawal minimum (660 sats) and `WITHDRAWAL_LIMIT`: constants in the withdrawal session
 
-```toml
-[bridge]
-network = "mainnet"
-confirmation_threshold = 6
-
-[bridge.bitcoin_clients]
-sender_rpc_url = "https://bitcoin-rpc-sender.example.com"
-verifier_rpc_url = "https://bitcoin-rpc-verifier.example.com"
-bridge_rpc_url = "https://bitcoin-rpc-bridge.example.com"
-max_connections = 50
-
-[bridge.security]
-bridge_address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7kw5rljs90"
-verifier_threshold = 7
-total_verifiers = 10
-
-[bridge.deposits]
-min_deposit_amount = 10000  # 0.0001 BTC minimum
-strict_validation = true
-
-[bridge.withdrawals]
-batch_size = 50
-max_fee_rate = 20
-security_delay_blocks = 144  # 24 hours
-```
+The active bridge address is read from the database (`via_wallets`) at runtime; the config value seeds wiring, and governance-driven bridge migrations update the database.
 
 ## Operational Guidelines
 
 ### Bridge Deployment Process
 
-1. **Pre-deployment Checklist**
-   ```bash
-   # Verify Bitcoin client connectivity
-   curl -X POST -H "Content-Type: application/json" \
-     -d '{"jsonrpc":"1.0","id":"test","method":"getblockchaininfo","params":[]}' \
-     http://localhost:18332
-   
-   # Validate bridge configuration
-   via-bridge validate-config --config bridge.toml
-   
-   # Test wallet connectivity
-   via-bridge test-wallet --wallet-name via_bridge_wallet
-   ```
+There is no `via-bridge` CLI. The real tooling:
 
-2. **Bootstrap Sequence**
-   ```bash
-   # Initialize bridge with testnet configuration
-   via-bridge init --network testnet --config bridge.toml
-   
-   # Generate verifier keys
-   via-bridge generate-keys --count 5 --threshold 3
-   
-   # Deploy bridge address
-   via-bridge deploy-address --keys verifier_keys.json
-```
-
-3. **Monitoring Setup**
-   ```bash
-   # Start bridge monitoring
-   via-bridge monitor --config bridge.toml --log-level info
-   
-   # Enable metrics collection
-   via-bridge metrics --port 9090 --enable-prometheus
-   ```
+1. **Key generation and bridge address derivation**: the runnable examples in `via_verifier/lib/via_musig2/examples/` (`key_generation_setup.rs` to generate keypairs, `compute_musig2.rs` to derive the aggregated MuSig2 bridge address, optionally with the governance script path)
+2. **Bootstrap**: inscribe the `SystemBootstrapping` message (declaring verifier keys, bridge address, governance and sequencer addresses) and set its txid in the genesis config's `bootstrap_txids`; nodes derive and persist `SystemWallets` from it at storage init
+3. **Monitoring**: metrics come from the built-in vise metrics (Prometheus exporter layer) and the healthcheck endpoints; there is no separate monitor process
 
 ### Best Practices for Bridge Operations
 
@@ -957,126 +539,31 @@ security_delay_blocks = 144  # 24 hours
 
 #### Operational Monitoring
 
-```rust
-pub struct BridgeMonitor {
-    pub deposit_rate: f64,
-    pub withdrawal_rate: f64,
-    pub average_confirmation_time: Duration,
-    pub failed_transactions: u64,
-    pub wallet_balance: u64,
-}
-
-impl BridgeMonitor {
-    pub async fn collect_metrics(&mut self) -> Result<BridgeMetrics, MonitoringError> {
-        let metrics = BridgeMetrics {
-            deposits_per_hour: self.calculate_deposit_rate().await?,
-            withdrawals_per_hour: self.calculate_withdrawal_rate().await?,
-            average_fee_rate: self.get_average_fee_rate().await?,
-            utxo_count: self.get_utxo_count().await?,
-            pending_operations: self.get_pending_operations().await?,
-        };
-        
-        Ok(metrics)
-    }
-}
-```
+The real exported signals are the vise metrics: the BTC watcher's `deposit` counter, `withdrawal_confirmed` counter, and `inscriptions_processed` gauges; the coordinator's `session_time` gauge and error counters; and the reorg/reverter module metrics. Watch the pending UTXO context depth and `Insufficient funds` selection errors for bridge-liquidity pressure (see `utxo_management.md`).
 
 ## Troubleshooting Common Bridge Issues
 
 ### Deposit Issues
 
-#### Issue: Deposits Not Being Detected
-```bash
-# Check Bitcoin client connectivity
-via-bridge check-btc-client --endpoint http://localhost:18332
-
-# Verify bridge address monitoring
-via-bridge check-address --address tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx
-
-# Check indexer status
-via-bridge indexer-status --last-block
-```
-
-**Solution Steps:**
-1. Verify Bitcoin client is synced and accessible
-2. Check bridge address configuration
-3. Ensure indexer is processing blocks correctly
-4. Validate deposit transaction format
-
-#### Issue: Invalid Deposit Validation
-```bash
-# Check deposit validation logs
-tail -f /var/log/via-bridge/deposits.log | grep "Invalid deposit"
-
-# Validate specific deposit
-via-bridge validate-deposit --txid <transaction_id>
-```
-
-**Common Causes:**
-- L2 receiver address below minimum threshold
-- Deposit amount below minimum requirement
-- Invalid transaction format
+**Deposits not being detected:**
+1. Verify the Bitcoin node is synced and the RPC reachable
+2. Check the active bridge address in the `via_wallets` table matches what users deposit to (a governance bridge migration changes it)
+3. Check the watcher's last-processed block in the indexer table against the Bitcoin tip; the watcher pauses entirely while a reorg marker is present
+4. Confirm the deposit passes `ViaL1Deposit::is_valid_deposit()`: receiver above the system address space, and value covering the fixed L2 gas cost
 
 ### Withdrawal Issues
 
-#### Issue: Withdrawal Transactions Not Being Signed
-```bash
-# Check verifier connectivity
-via-bridge check-verifiers --config bridge.toml
+**Withdrawals not being signed:**
+1. All verifiers must be online (n-of-n); check each verifier can reach `coordinator_http_url`
+2. Verifier public key sets must be identical (and identically ordered) across nodes
+3. `bridge_address_merkle_root` must match across nodes; a mismatch invalidates every partial signature
+4. A stuck session clears after `session_timeout`; check the coordinator's session endpoint and `verify_partial_signature` rejections in logs
+5. Verifiers refuse to sign during reorg/sync; check the gating state
 
-# Verify MuSig2 session status
-via-bridge musig2-status --session-id <session_id>
-```
-
-**Solution Steps:**
-1. Ensure sufficient verifiers are online
-2. Check verifier key configuration
-3. Verify MuSig2 session coordination
-4. Check withdrawal transaction format
-
-#### Issue: High Transaction Fees
-```bash
-# Check current fee rates
-via-bridge fee-estimate --target-blocks 6
-
-# Optimize UTXO selection
-via-bridge optimize-utxos --wallet via_bridge_wallet
-```
-
-**Optimization Strategies:**
-- Implement UTXO consolidation during low-fee periods
-- Use dynamic fee estimation
-- Batch multiple withdrawals when possible
-
-### Configuration Issues
-
-#### Issue: Bitcoin Client Connection Failures
-```bash
-# Test all configured endpoints
-via-bridge test-endpoints --config bridge.toml
-
-# Check authentication
-via-bridge test-auth --rpc-url http://localhost:18332
-```
-
-**Common Solutions:**
-- Verify RPC credentials and permissions
-- Check network connectivity and firewall rules
-- Ensure Bitcoin client is running and synced
-
-#### Issue: Database Query Timeouts
-```bash
-# Check database connectivity
-via-bridge test-db --connection-string postgresql://...
-
-# Analyze slow queries
-via-bridge analyze-queries --slow-threshold 5s
-```
-
-**Performance Improvements:**
-- Increase connection pool size
-- Optimize database indexes
-- Implement query result caching
+**High transaction fees / stuck withdrawals:**
+- The fee rate is re-checked at signing time (±1 sat/vB); a fast-moving mempool can reject sessions until rates stabilize
+- Withdrawals below 660 sats are filtered at the session level and stay pending
+- Consolidate bridge UTXOs (`get_utxos_to_merge`) during low-fee periods
 
 ## Interactions with Other Components
 
@@ -1138,11 +625,11 @@ The Sequencer processes L1→L2 messages (deposits) as priority operations in th
 
 The bridge component uses several configuration parameters:
 
-- **Bridge Address**: The Bitcoin address of the bridge (MuSig2 multi-signature address)
-- **Verifier Public Keys**: Public keys of the verifiers participating in the MuSig2 scheme
-- **Confirmation Threshold**: Number of Bitcoin confirmations required for deposits
-- **Agreement Threshold**: Percentage of verifiers required to agree on a withdrawal
-- **Poll Interval**: How frequently to check for new blocks and transactions
+- **Bridge Address**: The Bitcoin address of the bridge (MuSig2 aggregated key; active value read from `via_wallets` at runtime)
+- **Verifier Public Keys**: Public keys of the verifiers participating in the MuSig2 scheme (`ViaBridgeConfig.verifiers_pub_keys`)
+- **Confirmation Threshold**: Number of Bitcoin confirmations before the watcher processes messages (`via_btc_watch`)
+- **Agreement Threshold**: Batch finalization requires 2/3 of attestations (shared constant, not config); withdrawals require all verifiers (n-of-n)
+- **Poll Interval**: How frequently to check for new blocks and transactions (`via_btc_watch`)
 
 ## System Architecture Summary
 
@@ -1188,52 +675,20 @@ The system's comprehensive architecture provides robust functionality through:
 8. **Operational Excellence**: Detailed operational guidelines, troubleshooting procedures, and best practices
 
 These features ensure the bridge operates with optimal security, reliability, and operational efficiency while maintaining the core principles of decentralization and transparency that are fundamental to the Via L2 system.
-### Bridge Transaction IDs: Coordinator DAL Helpers and Flow
+### Withdrawal Tracking: Current Data Model
 
-This release introduces dedicated DAL helpers for persisting and tracking bridge transaction IDs associated with withdrawal sessions. These helpers allow the Coordinator to:
-- Store unsigned bridge transactions for a votable transaction
-- Retrieve the stored unsigned transactions for a session
-- Update a stored entry with the final broadcast txid once signing and broadcast succeed
-- Create no-op records when a finalized batch has no withdrawals
+An earlier revision tracked withdrawal sessions through a `ViaBridgeDal` keyed by votable transaction and candidate index (its `bridge_tx` migration, `20250714093607_bridge_tx.up.sql`, still exists in the migrations directory). The current design tracks **individual withdrawals** instead, in `withdrawals_dal.rs`:
 
-Key components and call sites:
-- Coordinator workflow
-  - After building unsigned transactions, the session stores all variants for the votable transaction:
-    - Call site: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs#L492)
-    - DAL method: [ViaBridgeDal::insert_bridge_txs()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/src/via_bridge.rs#L11)
-  - To resume a session, the Coordinator loads the stored unsigned transactions. The entry with an empty hash indicates the candidate to be signed:
-    - Call site: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs#L292)
-    - DAL method: [ViaBridgeDal::get_vote_transaction_bridge_txs()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/src/via_bridge.rs#L91)
-  - After broadcasting the final signed transaction, the session updates the record with the actual txid hash:
-    - Call site: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs#L181)
-    - DAL method: [ViaBridgeDal::update_bridge_tx()](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/src/via_bridge.rs#L64)
-  - For finalized batches that contain no withdrawals, the session records a no-op entry (index 0) to mark the batch processed:
-    - Call site: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](https://github.com/vianetwork/via-core/blob/main/via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs#L246)
-    - DAL method: [`rust ViaBridgeDal::update_bridge_tx()`](via_verifier/lib/verifier_dal/src/via_bridge.rs) with a zero hash
+- Withdrawals from finalized batches are inserted individually (keyed by their withdrawal id: L2 tx hash + log index provenance)
+- A session selects up to `WITHDRAWAL_LIMIT` unprocessed withdrawals of at least 660 sats; whatever a broadcast transaction pays gets marked processed against the recorded bridge withdrawal txid
+- Reconciliation is idempotent and driven by the on-chain transaction itself (both the coordinator's `after_broadcast_final_transaction` and any verifier's BTC-watch `WithdrawalProcessor` converge to the same state)
+- No no-op records are needed: a batch with no withdrawals simply contributes nothing to the pending set
 
-- Votable transaction lookup
-  - The Coordinator resolves the votable transaction ID from the proof reveal txid bytes:
-    - Call site: [via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs](via_verifier/node/via_verifier_coordinator/src/sessions/withdrawal.rs:505)
-    - DAL method: [ViaVotesDal::get_votable_transaction_id()](via_verifier/lib/verifier_dal/src/via_votes_dal.rs:57)
-
-Data model semantics:
-- Multiple unsigned bridge transactions may be stored for a single votable transaction (e.g., weight splits or alternatives)
-- Each stored row has:
-  - data: the serialized unsigned bridge transaction bytes
-  - index: the position within the set for deterministic retrieval
-  - hash: empty until a final signed transaction is broadcast, then updated with the txid
-- Retrieval is ordered by insertion, enabling the Coordinator to pick the entry with an empty hash as the current candidate
-
-- Migration: [via_verifier/lib/verifier_dal/migrations/20250714093607_bridge_tx.up.sql](https://github.com/vianetwork/via-core/blob/main/via_verifier/lib/verifier_dal/migrations/20250714093607_bridge_tx.up.sql)
-  - Unique constraints: (`votable_tx_id`, `index`) is unique (hash is not unique).
-
-Cross-reference:
-- Fee-aware construction and validation of withdrawals, including fee rate tolerance and output filtering, are described in the fee mechanism:
-  - See Fee Strategy section: [fee_mechanism.md](fee_mechanism.md)
+Cross-reference: fee-aware construction and validation (fee-rate tolerance, output filtering) in [fee_mechanism.md](fee_mechanism.md); verbatim flows in [withdrawal_finalization.md](withdrawal_finalization.md).
 
 ---
 
-## Deterministic PriorityOpId (deposits) — updated encoding
+## Deterministic PriorityOpId (deposits) - updated encoding
 
 - Deposits now derive a deterministic PriorityOpId from Bitcoin L1 metadata: `(block_number, tx_index, output_vout)` provided by the indexer. This removes the need for any sequential counters in watchers or indexer ingestion paths.
 - Encoding and type:
@@ -1244,4 +699,4 @@ Cross-reference:
   - The indexer must attach `tx_index` and `output_vout` when parsing deposits so the bridge can derive the id deterministically. See transport metadata plumbed via `TransactionWithMetadata` in [core/lib/via_btc_client/src/indexer/](https://github.com/vianetwork/via-core/blob/main/core/lib/via_btc_client/src/indexer/).
 - Operational implications:
   - Stable, replayable ordering of deposits across restarts/reindexing.
-  - Ingestion paths no longer maintain “next expected priority id” state; the via_indexer deposit processor was simplified accordingly (see [via_indexer/node/indexer/src/message_processors/deposit.rs](https://github.com/vianetwork/via-core/blob/main/via_indexer/node/indexer/src/message_processors/deposit.rs)).
+  - Ingestion paths no longer maintain "next expected priority id" state; the via_indexer deposit processor was simplified accordingly (see [via_indexer/node/indexer/src/message_processors/deposit.rs](https://github.com/vianetwork/via-core/blob/main/via_indexer/node/indexer/src/message_processors/deposit.rs)).

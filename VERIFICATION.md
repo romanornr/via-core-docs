@@ -1,0 +1,31 @@
+# Verification Ledger
+
+This repository previously contained auto-generated content with fabricated code (see commit `fdceab6`). This ledger tracks which documents have since been verified line-by-line against the via-core source, and against which commit. Files not listed here have **not** been verified and may contain stale or invented claims.
+
+Method: every concrete claim (paths, struct fields, function signatures, constants, config keys, SQL) is checked against the source tree; fabricated or stale code is replaced with verbatim current source. Docs keep full code depth by design.
+
+## Verified against via-core `e383a2990` (2026-07-02)
+
+| Document | Outcome |
+|----------|---------|
+| `inscription_interaction.md` | Corrected type catalog (7 inscribable / 12 parsed variants), bootstrap input fields, wire tags, `VIA_WI` withdrawal OP_RETURN layout, DA-flag wiring |
+| `tapscript_usage.md` | Corrected taproot tweak (`merkle_root` param), `get_tr_sighashes` per-input API, type catalog |
+| `utxo_management.md` | Rewritten from source: real `UtxoManager`, largest-first selection, pending-tx context, inscriber-side FIFO chaining. Fabricated selector/consolidator/fee-estimator removed |
+| `musig2_implementation.md` | Updated to `TransactionBuilderConfig` API, per-input signing (`signer_per_utxo_input`), DAL-driven withdrawal sessions, derived n-of-n `required_signers` |
+| `verifier_network.md` | Updated to `ViaNodeRole`, current node-builder layers, DB-persisted watcher progress, per-input signing state |
+| `verifier.md` | Fabricated config/sync/resource/metrics/CLI sections replaced with real `ViaVerifierConfig`, DAL-backed gating, `BtcClientLayer`, vise metrics, versioned `via_verification` modules; depth pass added verbatim session hooks, canonical-chain DAL bodies, governance processors, real `main.rs` (bin is `verifier_server`), rebuilt storage-init section; invented `zk_agreement_threshold`/`process_system_contract_upgrade` removed |
+| `withdrawal_finalization.md` | Updated to current pipeline: `via_withdrawal_dal` sessions, versioned `VIA_WI` OP_RETURN with withdrawal ids, per-input aggregation, idempotent `WithdrawalProcessor` reconciliation |
+| `celestia_integration.md` | Added DaBackend selection, fallback client, `ViaDaBlob` chunking/manifest, `index` column; corrected `ViaCelestiaConfig` (auth via secrets) and `CelestiaClient` construction; depth pass added verbatim client bodies, real `via_data_availability` DDL + chunking migration, dispatcher metrics, and the real `retry` backoff policy |
+| `batch_proofs.md` | Largely inherited zksync prover pipeline, verified sound; corrected witness-generator paths to `src/rounds/` |
+| `zkproof_handling.md` | Corrected `via_verification` layout to per-version modules (`version_27`/`version_28`); finalization threshold made precise (`BATCH_FINALIZATION_THRESHOLD = 0.66`, not simple majority) |
+| `fee_mechanism.md` | Added the real `via_fee_model` (inscription-cost-derived gas price); replaced invented fee-strategy TOML/CLI/mempool machinery with real `ViaBtcClientConfig`, `get_fee_rate` flow, hardcoded `FeeRateLimits`; depth pass added verbatim `FeeStrategy`/`WithdrawalFeeStrategy::apply_fee_to_outputs`, `_verify_withdrawals`, full `get_fee_rate` body; invented `estimate_fee_sats` and `user_should_receive` claims removed |
+| `l1_watcher.md` | Current `BitcoinClient`/`BitcoinInscriptionIndexer`/`VerifierBtcWatch` shapes (SystemWallets, DB cursor, reorg gate); idempotent `WithdrawalProcessor`; full message catalog; threshold as shared constant; depth pass added verbatim `ViaL1Deposit`/`ViaPriorityOpId`, governance processor, full `loop_iteration`, real `ViaBtcWatchConfig` (`block_confirmations`, not `confirmations_for_btc_msg`) and real metrics (no `btc_poll`) |
+| `sequencer.md` | Paths corrected to `via_state_keeper`; real seven-criteria `default_sealers()` plus IO-level `TimeoutSealer`; real `ViaAggregatedOperation` enum; depth pass added verbatim keeper/IO/executor/metrics structs and seal-resolution code; corrected `BTC_METRICS` (does not exist), executor paths, and config values (`block_commit_deadline_ms` 2500 is `for_tests()`, base env uses 5000; `max_pubdata_per_batch` 100000) |
+| `architecture_overview.md` | Prose-level doc, largely sound; finalization stated as 2/3 threshold, bridge as n-of-n (not "threshold"), proof DA/inscription attributed to dispatcher/BTC sender rather than prover |
+| `bridge.md` | Real `ViaL1Deposit` validation (system-address floor + gas coverage, not invented minimums); fabricated multi-client managers, wallet/testnet config bundles, `bridge_operations` SQL, and `via-bridge` CLI removed; current per-input withdrawal flow and `withdrawals_dal` tracking |
+| `l1_indexer.md` | Real four-table schema (no `bridge_withdrawals`), verbatim `L1Indexer` loop and both processors, real `ViaIndexerConfig`/`main.rs` env loading (no `VIA_INDEXER_*` vars), real `docker/via-l1-indexer` Dockerfile and `via indexer` CLI, actual two-gauge metrics (reused `via_verifier_btc_watch` prefix) |
+| `key_management.md` | Updated `create_request_headers` (merkle-root signer, `X-Sequencer-Version`), real env names (`VIA_BRIDGE_VERIFIERS_PUB_KEYS`, `VIA_BTC_SENDER_PRIVATE_KEY`), current 10-field `SystemBootstrappingInput`, merkle-root-aware taproot tweak, runtime `SystemWallets` rotation via governance; stale `recursion_scheduler_level_vk_hash` replaced with `snark_wrapper_vk_hash` flow |
+
+## Not yet verified
+
+All other documents, including: `workflow_analysis.md`, `design_patterns.md`, `bottlenecks/`, `proposer.md`, `mempool.md`, `state_management.md`, `system_contracts.md`, `rpc_api_layer.md`, `external_node.md`, `cli_reference.md`, and the remaining files. Treat unverified code excerpts with suspicion until they appear in the table above.

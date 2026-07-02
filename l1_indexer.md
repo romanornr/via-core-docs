@@ -1,11 +1,10 @@
 # Via L2 Bitcoin L1 Indexer System
 
-> **Note (2026-04-11):** This document's description of the L1 Indexer as a separate service is correct.
-> However, it overstates the indexer's complexity — the real schema has only 3 tables (deposits,
-> withdrawals, indexer_metadata), not the elaborate schema implied here. The deposit/withdrawal
-> processor logic is simpler than described. The indexer database has no bridge_withdrawals,
-> utxos, or validation workflow tables.
-> See the wiki page `via-bitcoin-watchers-btc-watch-and-l1-indexer.md` for verified documentation.
+> **Note:** The L1 Indexer is a separate service (its own binary and database) that shares the
+> `BitcoinInscriptionIndexer` parsing library with the node watchers. The real schema has four
+> tables: `deposits`, `withdrawals`, `indexer_metadata`, and `via_wallets` (added by the wallet
+> migration). There is no `bridge_withdrawals` table; withdrawals are stored individually, keyed
+> by their L2 withdrawal id.
 
 ## Overview
 
@@ -58,28 +57,39 @@ graph TB
 
 The L1 Indexer consists of several key components working together:
 
-#### 1. Indexer Service (`via_indexer`)
+#### 1. Indexer Service (`via_indexer` crate, `via_indexer/node/indexer/`)
 
-The main indexer service responsible for:
-- Bitcoin blockchain monitoring
-- Transaction parsing and validation
-- Message processing coordination
-- Database operations management
+The core service struct polls Bitcoin in chunks of 100 blocks and drives the message processors:
 
-#### 2. Data Access Layer (`via_indexer_dal`)
+```rust
+// via_indexer/node/indexer/src/lib.rs
+/// Total L1 blocks to process at a time.
+pub const L1_BLOCKS_CHUNK: u32 = 100;
+
+#[derive(Debug)]
+pub struct L1Indexer {
+    config: ViaBtcWatchConfig,
+    indexer: BitcoinInscriptionIndexer,
+    pool: ConnectionPool<Indexer>,
+    system_wallet_processor: Box<dyn MessageProcessor>,
+    message_processors: Vec<Box<dyn MessageProcessor>>,
+}
+```
+
+#### 2. Data Access Layer (`via_indexer_dal`, `via_indexer/lib/via_indexer_dal/`)
 
 Provides database abstraction with:
-- **ViaIndexerDal**: Metadata and state management
-- **ViaTransactionsDal**: Transaction data operations
-- **Connection Management**: Database connection pooling
-- **Migration Support**: Schema versioning and updates
+- **ViaIndexerDal** (`via_indexer_dal.rs`): per-module progress metadata
+- **ViaTransactionsDal** (`via_transactions_dal.rs`): deposit and withdrawal rows
+- **ViaWalletDal** (`via_wallet_dal.rs`): persisted `SystemWallets`
+- sqlx migrations under `migrations/`
 
-#### 3. Message Processors
+#### 3. Message Processors (`src/message_processors/`)
 
-Specialized processors for different message types:
-- **Deposit Processor**: Handles L1→L2 deposit transactions
-- **Withdrawal Processor**: Processes L2→L1 withdrawal transactions
-- **Bridge Withdrawal Processor**: Manages bridge withdrawal inscriptions
+One processor per concern, all implementing the `MessageProcessor` trait:
+- **`L1ToL2MessageProcessor`** (`deposit.rs`): L1→L2 deposits
+- **`WithdrawalProcessor`** (`withdrawal.rs`): executed bridge withdrawals (`BridgeWithdrawal` messages)
+- **`SystemWalletProcessor`** (`system_wallet.rs`): governance wallet rotations; runs before the other two
 
 ### Component Interaction
 
@@ -109,88 +119,47 @@ The L1 Indexer introduces a dedicated database schema optimized for indexing ope
 
 #### 1. Deposits Table
 
-Stores L1→L2 deposit transactions:
+Stores L1→L2 deposit transactions (`migrations/20250604191948_deposit_withdraw.up.sql`):
 
 ```sql
 CREATE TABLE IF NOT EXISTS deposits (
     "priority_id" BIGINT NOT NULL,
     "tx_id" BYTEA NOT NULL,
     "block_number" BIGINT NOT NULL,
-    "receiver" BYTEA NOT NULL,
+    "sender" VARCHAR NOT NULL,
+    "receiver" VARCHAR NOT NULL,
     "value" BIGINT NOT NULL,
     "calldata" BYTEA,
     "canonical_tx_hash" BYTEA NOT NULL UNIQUE,
-    "created_at" TIMESTAMP NOT NULL DEFAULT NOW(),
+    "created_at" BIGINT NOT NULL,
     PRIMARY KEY (tx_id)
 );
 ```
 
-**Field Descriptions:**
-- `priority_id`: Sequential identifier for deposit ordering
-- `tx_id`: Bitcoin transaction ID (32 bytes)
-- `block_number`: Bitcoin block number containing the transaction
-- `receiver`: L2 receiver address (20 bytes)
-- `value`: Deposit amount in satoshis
-- `calldata`: Optional transaction calldata
-- `canonical_tx_hash`: Unique hash for L2 transaction
-- `created_at`: Timestamp of record creation
+The `priority_id` is the deterministic id derived from `(block_number, tx_index, vout)`, not a sequential counter. `sender` and `receiver` are stored as strings (Bitcoin sender address, L2 receiver).
 
-#### 2. Bridge Withdrawals Table
+#### 2. Withdrawals Table
 
-Tracks bridge withdrawal transactions:
+Individual executed withdrawals, keyed by their **L2 withdrawal id** (the same id embedded in the bridge transaction's OP_RETURN data):
 
 ```sql
-CREATE TABLE IF NOT EXISTS bridge_withdrawals (
-    "id" SERIAL PRIMARY KEY,
-    "tx_id" BYTEA NOT NULL UNIQUE,
-    "l1_batch_reveal_tx_id" BYTEA NOT NULL,
-    "fee" BIGINT NOT NULL,
-    "vsize" BIGINT NOT NULL,
-    "total_size" BIGINT NOT NULL,
-    "withdrawals_count" BIGINT NOT NULL,
-    "block_number" BIGINT NOT NULL UNIQUE,
+CREATE TABLE IF NOT EXISTS withdrawals (
+    "id" VARCHAR UNIQUE NOT NULL,
+    "tx_id" BYTEA NOT NULL,
+    "l2_tx_log_index" BIGINT NOT NULL,
+    "receiver" VARCHAR NOT NULL,
+    "value" BIGINT NOT NULL,
+    "block_number" BIGINT NOT NULL,
+    "timestamp" BIGINT NOT NULL,
     "created_at" TIMESTAMP NOT NULL DEFAULT NOW()
 );
 ```
 
-**Field Descriptions:**
-- `id`: Auto-incrementing primary key
-- `tx_id`: Bitcoin transaction ID
-- `l1_batch_reveal_tx_id`: Associated L1 batch proof transaction
-- `fee`: Transaction fee in satoshis
-- `vsize`: Virtual transaction size
-- `total_size`: Total transaction size in bytes
-- `withdrawals_count`: Number of withdrawals in transaction
-- `block_number`: Bitcoin block number
-- `created_at`: Record creation timestamp
+Note there is **no** separate `bridge_withdrawals` table (the earlier design's UNIQUE constraint on block number was dropped precisely because multiple withdrawal bundles per block are allowed); each row records which Bitcoin transaction (`tx_id`) paid which L2 withdrawal (`id`, `l2_tx_log_index`).
 
-#### 3. Withdrawals Table
+#### 3. Indexer Metadata Table
 
-Individual withdrawal details:
-
-```sql
-CREATE TABLE IF NOT EXISTS withdrawals (
-    "id" SERIAL PRIMARY KEY,
-    "bridge_withdrawal_id" INTEGER NOT NULL,
-    "tx_index" BIGINT NOT NULL,
-    "receiver" VARCHAR NOT NULL,
-    "value" BIGINT NOT NULL,
-    "created_at" TIMESTAMP NOT NULL DEFAULT NOW(),
-    FOREIGN KEY (bridge_withdrawal_id) REFERENCES bridge_withdrawals (id) ON DELETE CASCADE
-);
-```
-
-**Field Descriptions:**
-- `id`: Auto-incrementing primary key
-- `bridge_withdrawal_id`: Foreign key to bridge_withdrawals table
-- `tx_index`: Index of withdrawal within transaction
-- `receiver`: Bitcoin address receiving the withdrawal
-- `value`: Withdrawal amount in satoshis
-- `created_at`: Record creation timestamp
-
-#### 4. Indexer Metadata Table
-
-Tracks indexer state and progress:
+Tracks indexer progress per module:
 
 ```sql
 CREATE TABLE IF NOT EXISTS indexer_metadata (
@@ -200,55 +169,9 @@ CREATE TABLE IF NOT EXISTS indexer_metadata (
 );
 ```
 
-**Field Descriptions:**
-- `module`: Indexer module name (e.g., "deposit", "withdrawal")
-- `last_indexer_l1_block`: Last processed Bitcoin block number
-- `updated_at`: Last update timestamp
+#### 4. Via Wallets Table
 
-### Database Relationships
-
-```mermaid
-erDiagram
-    DEPOSITS {
-        bigint priority_id PK
-        bytea tx_id
-        bigint block_number
-        bytea receiver
-        bigint value
-        bytea calldata
-        bytea canonical_tx_hash UK
-        timestamp created_at
-    }
-    
-    BRIDGE_WITHDRAWALS {
-        serial id PK
-        bytea tx_id UK
-        bytea l1_batch_reveal_tx_id
-        bigint fee
-        bigint vsize
-        bigint total_size
-        bigint withdrawals_count
-        bigint block_number UK
-        timestamp created_at
-    }
-    
-    WITHDRAWALS {
-        serial id PK
-        integer bridge_withdrawal_id FK
-        bigint tx_index
-        varchar receiver
-        bigint value
-        timestamp created_at
-    }
-    
-    INDEXER_METADATA {
-        varchar module PK
-        bigint last_indexer_l1_block
-        timestamp updated_at
-    }
-    
-    BRIDGE_WITHDRAWALS ||--o{ WITHDRAWALS : contains
-```
+Added by `20250731184639_via_wallet_migration`: persists the `SystemWallets` (sequencer, governance, bridge, verifiers) so the indexer parses with the same address set as the node, including runtime wallet rotations.
 
 ## API Reference
 
@@ -262,17 +185,11 @@ Core indexer metadata operations:
 pub async fn init_indexer_metadata(&mut self, module: &str, l1_block: u32) -> DalResult<()>
 ```
 
-Initializes metadata for a specific indexer module.
+Initializes metadata for an indexer module. In practice there is a single module: `L1Indexer::module_name()` returns `"l1_indexer"`, and `initialize_indexer` seeds it with `start_l1_block_number - 1`.
 
 **Parameters:**
-- `module`: Module name (e.g., "deposit", "withdrawal")
+- `module`: Module name (`"l1_indexer"`)
 - `l1_block`: Starting Bitcoin block number
-
-**Example:**
-```rust
-let mut dal = connection.via_indexer_dal();
-dal.init_indexer_metadata("deposit", 800000).await?;
-```
 
 #### Update Last Processed Block
 
@@ -302,31 +219,70 @@ Transaction data operations:
 
 #### Insert Deposits
 
+Inserts a batch of deposit records in a single database transaction, with `ON CONFLICT (tx_id) DO NOTHING` making replays harmless (`via_indexer/lib/via_indexer_dal/src/via_transactions_dal.rs`):
+
 ```rust
-pub async fn insert_deposit_many(&mut self, deposits: Vec<Deposit>) -> DalResult<()>
+pub async fn insert_deposit_many(&mut self, deposits: Vec<Deposit>) -> DalResult<()> {
+    if deposits.is_empty() {
+        return Ok(());
+    }
+    let mut transaction = self.storage.start_transaction().await?;
+
+    for deposit in deposits {
+        sqlx::query!(
+            r#"
+            INSERT INTO
+            deposits (
+                priority_id,
+                tx_id,
+                block_number,
+                sender,
+                receiver,
+                value,
+                calldata,
+                canonical_tx_hash,
+                created_at
+            )
+            VALUES
+            ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (tx_id) DO NOTHING
+            "#,
+            deposit.priority_id,
+            deposit.tx_id,
+            i64::from(deposit.block_number),
+            deposit.sender,
+            deposit.receiver,
+            deposit.value,
+            deposit.calldata,
+            deposit.canonical_tx_hash,
+            deposit.block_timestamp as i64,
+        )
+        .instrument("insert_deposit")
+        .execute(&mut transaction)
+        .await?;
+    }
+
+    transaction.commit().await?;
+
+    Ok(())
+}
 ```
 
-Inserts multiple deposit records in a single transaction.
+The `Deposit` model (`src/models/deposit.rs`):
 
-**Parameters:**
-- `deposits`: Vector of deposit records
-
-**Example:**
 ```rust
-let deposits = vec![
-    Deposit {
-        priority_id: 1,
-        tx_id: tx_id_bytes,
-        block_number: 800001,
-        receiver: receiver_bytes,
-        value: 100000000, // 1 BTC in satoshis
-        calldata: vec![],
-        canonical_tx_hash: hash_bytes,
-    }
-];
-
-let mut dal = connection.via_transactions_dal();
-dal.insert_deposit_many(deposits).await?;
+#[derive(Debug, Clone)]
+pub struct Deposit {
+    pub priority_id: i64,
+    pub tx_id: Vec<u8>,
+    pub block_number: u32,
+    pub sender: String,
+    pub receiver: String,
+    pub value: i64,
+    pub calldata: Vec<u8>,
+    pub canonical_tx_hash: Vec<u8>,
+    pub block_timestamp: u64,
+}
 ```
 
 #### Check Deposit Existence
@@ -340,171 +296,271 @@ Checks if a deposit with the given transaction ID exists.
 #### Insert Withdrawal
 
 ```rust
-pub async fn insert_withdraw(
-    &mut self,
-    bridge_withdrawal_param: BridgeWithdrawalParam,
-    withdrawals: Vec<WithdrawalParam>,
-) -> DalResult<()>
+// via_indexer/lib/via_indexer_dal/src/via_transactions_dal.rs
+pub async fn insert_withdraw(&mut self, withdrawal: Withdrawal) -> DalResult<()>
 ```
 
-Inserts a bridge withdrawal with associated individual withdrawals.
+Inserts a single executed withdrawal. The model (`src/models/withdraw.rs`):
 
-**Example:**
 ```rust
-let bridge_withdrawal = BridgeWithdrawalParam {
-    tx_id: tx_id_bytes,
-    l1_batch_reveal_tx_id: batch_tx_id,
-    block_number: 800002,
-    fee: 5000,
-    vsize: 250,
-    total_size: 300,
-    withdrawals_count: 2,
-};
-
-let withdrawals = vec![
-    WithdrawalParam {
-        tx_index: 0,
-        receiver: "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh".to_string(),
-        value: 50000000,
-    },
-    WithdrawalParam {
-        tx_index: 1,
-        receiver: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
-        value: 45000000,
-    },
-];
-
-dal.insert_withdraw(bridge_withdrawal, withdrawals).await?;
+#[derive(Debug, Clone)]
+pub struct Withdrawal {
+    pub id: String,
+    pub tx_id: Vec<u8>,
+    pub l2_tx_log_index: i64,
+    pub block_number: i64,
+    pub receiver: String,
+    pub value: i64,
+    pub timestamp: i64,
+}
 ```
+
+The `id` is the L2 withdrawal id recovered from the bridge transaction's OP_RETURN data; `tx_id` is the Bitcoin transaction that paid it. One `BridgeWithdrawal` message from the parser yields one `insert_withdraw` call per constituent withdrawal.
 
 ## Message Processing
 
-### Deposit Processing
+### Indexing Loop
 
-The deposit processor handles L1→L2 transactions:
+The main loop lives in `via_indexer/node/indexer/src/lib.rs`. Each tick it advances at most `L1_BLOCKS_CHUNK` (100) blocks, runs the system-wallet processor first, and re-parses the same block range if wallets changed (a rotation can change how subsequent messages are interpreted):
 
 ```rust
-pub struct DepositProcessor {
-    pool: ConnectionPool<Indexer>,
+async fn loop_iteration(
+    &mut self,
+    storage: &mut Connection<'_, Indexer>,
+) -> anyhow::Result<()> {
+    let last_processed_bitcoin_block = storage
+        .via_indexer_dal()
+        .get_last_processed_l1_block(L1Indexer::module_name())
+        .await? as u32;
+
+    let current_l1_block_number = self.indexer.fetch_block_height().await? as u32;
+    if current_l1_block_number <= last_processed_bitcoin_block {
+        return Ok(());
+    }
+
+    let mut to_block = last_processed_bitcoin_block + L1_BLOCKS_CHUNK;
+    if to_block > current_l1_block_number {
+        to_block = current_l1_block_number;
+    }
+
+    let mut messages = self
+        .indexer
+        .process_blocks(last_processed_bitcoin_block + 1, to_block)
+        .await?;
+
+    // Re-process blocks if system wallets were updated, since the new wallet state
+    // may change how subsequent messages are interpreted.
+    if self
+        .system_wallet_processor
+        .process_messages(storage, messages.clone(), &mut self.indexer)
+        .await?
+    {
+        messages = self
+            .indexer
+            .process_blocks(last_processed_bitcoin_block + 1, to_block)
+            .await?;
+    }
+
+    for processor in self.message_processors.iter_mut() {
+        processor
+            .process_messages(storage, messages.clone(), &mut self.indexer)
+            .await?;
+    }
+
+    storage
+        .via_indexer_dal()
+        .update_last_processed_l1_block(L1Indexer::module_name(), to_block)
+        .await?;
+
+    METRICS
+        .current_block_number
+        .set(current_l1_block_number as usize);
+    METRICS.last_indexed_block_number.set(to_block as usize);
+
+    tracing::info!(
+        "Blocks from {} to {} processed",
+        last_processed_bitcoin_block,
+        to_block
+    );
+
+    Ok(())
 }
 
-impl DepositProcessor {
-    pub async fn process_l1_to_l2_message(
-        &self,
-        message: &L1ToL2Message,
-        block_number: u32,
-    ) -> anyhow::Result<()> {
-        // Extract deposit information
-        let deposit = Deposit {
-            priority_id: self.get_next_priority_id().await?,
-            tx_id: message.common.tx_id.to_vec(),
-            block_number,
-            receiver: message.input.receiver_l2_address.as_bytes().to_vec(),
-            value: message.input.value as i64,
-            calldata: message.input.calldata.clone(),
-            canonical_tx_hash: self.calculate_canonical_hash(&message).await?,
-        };
+fn module_name() -> &'static str {
+    "l1_indexer"
+}
+```
 
-        // Store deposit
-        let mut connection = self.pool.connection().await?;
-        connection.via_transactions_dal()
-            .insert_deposit_many(vec![deposit])
+Progress is tracked under the single module name `"l1_indexer"` in `indexer_metadata`. On startup, `initialize_indexer` wipes and re-seeds everything when `restart_indexing` is set or when no progress row exists yet:
+
+```rust
+async fn initialize_indexer(
+    storage: &mut Connection<'_, Indexer>,
+    start_l1_block_number: u32,
+    restart_indexing: bool,
+) -> anyhow::Result<()> {
+    let last_processed_bitcoin_block = storage
+        .via_indexer_dal()
+        .get_last_processed_l1_block(L1Indexer::module_name())
+        .await? as u32;
+
+    if restart_indexing || last_processed_bitcoin_block == 0 {
+        let mut transaction = storage.start_transaction().await?;
+
+        transaction
+            .via_transactions_dal()
+            .delete_transactions(start_l1_block_number as i64)
+            .await?;
+        transaction.via_indexer_dal().delete_metadata().await?;
+        transaction
+            .via_indexer_dal()
+            .init_indexer_metadata(L1Indexer::module_name(), start_l1_block_number - 1)
             .await?;
 
-        Ok(())
+        transaction.commit().await?;
+    }
+
+    Ok(())
+}
+```
+
+The polling cadence, start block, and restart flag all come from `ViaBtcWatchConfig` (the same config type the node watchers use): `run()` ticks on `self.config.poll_interval()`.
+
+### Deposit Processing
+
+The deposit processor consumes parsed `L1ToL2Message`s. There is no sequential priority-id counter: each deposit's priority id derives deterministically from `(block_number, tx_index, output_vout)` via `ViaL1Deposit::priority_id()`, so replays and reindexing produce identical ids.
+
+```rust
+// via_indexer/node/indexer/src/message_processors/deposit.rs
+#[async_trait::async_trait]
+impl MessageProcessor for L1ToL2MessageProcessor {
+    async fn process_messages(
+        &mut self,
+        storage: &mut Connection<'_, Indexer>,
+        msgs: Vec<FullInscriptionMessage>,
+        _: &mut BitcoinInscriptionIndexer,
+    ) -> anyhow::Result<bool> {
+        let mut deposits = Vec::new();
+
+        for msg in msgs {
+            if let FullInscriptionMessage::L1ToL2Message(l1_to_l2_msg) = msg {
+                let mut tx_id_bytes = l1_to_l2_msg.common.tx_id.as_raw_hash()[..].to_vec();
+                tx_id_bytes.reverse();
+                let tx_id = H256::from_slice(&tx_id_bytes);
+
+                if storage
+                    .via_transactions_dal()
+                    .deposit_exists(&tx_id_bytes)
+                    .await?
+                {
+                    tracing::warn!(
+                        "Deposit {} already indexed",
+                        l1_to_l2_msg.common.tx_id.to_string()
+                    );
+                    continue;
+                }
+
+                let block = self
+                    .client
+                    .get_block_stats(u64::from(l1_to_l2_msg.common.block_height))
+                    .await?;
+                let Some(l1_tx) =
+                    self.create_l1_tx_from_message(block.time, tx_id, &l1_to_l2_msg)?
+                else {
+                    tracing::warn!("Invalid deposit, l1 tx_id {}", &l1_to_l2_msg.common.tx_id);
+                    continue;
+                };
+
+                deposits.push(l1_tx);
+            }
+        }
+
+        storage
+            .via_transactions_dal()
+            .insert_deposit_many(deposits)
+            .await?;
+
+        Ok(true)
     }
 }
 ```
+
+Note the details: the Bitcoin txid bytes are reversed for the H256 key (endianness), duplicates are skipped via `deposit_exists`, the block timestamp comes from `get_block_stats`, and invalid deposits (failing `ViaL1Deposit::is_valid_deposit()`) are logged and skipped rather than erroring the batch.
 
 ### Withdrawal Processing
 
-The withdrawal processor handles L2→L1 transactions:
+The withdrawal processor consumes parsed `BridgeWithdrawal` messages (the parser has already validated the transaction spends from the bridge):
 
 ```rust
-pub struct WithdrawalProcessor {
-    pool: ConnectionPool<Indexer>,
-}
+// via_indexer/node/indexer/src/message_processors/withdrawal.rs
+#[async_trait::async_trait]
+impl MessageProcessor for WithdrawalProcessor {
+    async fn process_messages(
+        &mut self,
+        storage: &mut Connection<'_, Indexer>,
+        msgs: Vec<FullInscriptionMessage>,
+        _: &mut BitcoinInscriptionIndexer,
+    ) -> anyhow::Result<bool> {
+        for msg in msgs {
+            if let FullInscriptionMessage::BridgeWithdrawal(withdrawal_msg) = msg {
+                let tx_id = withdrawal_msg.common.tx_id.as_byte_array().to_vec();
+                let withdrawals = get_withdrawal_requests(withdrawal_msg.input.withdrawals);
 
-impl WithdrawalProcessor {
-    pub async fn process_bridge_withdrawal(
-        &self,
-        message: &BridgeWithdrawal,
-        block_number: u32,
-    ) -> anyhow::Result<()> {
-        // Extract bridge withdrawal information
-        let bridge_withdrawal = BridgeWithdrawalParam {
-            tx_id: message.common.tx_id.to_vec(),
-            l1_batch_reveal_tx_id: message.input.l1_batch_proof_reveal_tx_id.clone(),
-            block_number: block_number as i64,
-            fee: self.calculate_fee(&message.input)?,
-            vsize: message.input.v_size,
-            total_size: message.input.total_size,
-            withdrawals_count: message.input.withdrawals.len() as i64,
-        };
+                tracing::info!(
+                    "New bridge withdrawal found: hash: {}, count: {}",
+                    tx_id.to_hex_string(Case::Lower),
+                    withdrawals.len()
+                );
 
-        // Extract individual withdrawals
-        let withdrawals: Vec<WithdrawalParam> = message.input.withdrawals
-            .iter()
-            .enumerate()
-            .map(|(index, (receiver, value))| WithdrawalParam {
-                tx_index: index as i64,
-                receiver: receiver.clone(),
-                value: *value,
-            })
-            .collect();
+                let block = self
+                    .client
+                    .get_block_stats(withdrawal_msg.common.block_height as u64)
+                    .await?;
 
-        // Store withdrawal data
-        let mut connection = self.pool.connection().await?;
-        connection.via_transactions_dal()
-            .insert_withdraw(bridge_withdrawal, withdrawals)
-            .await?;
+                if !withdrawals.is_empty() {
+                    let mut transaction = storage.start_transaction().await?;
+                    for w in withdrawals {
+                        transaction
+                            .via_transactions_dal()
+                            .insert_withdraw(Withdrawal {
+                                id: w.id,
+                                tx_id: tx_id.clone(),
+                                l2_tx_log_index: w.l2_tx_log_index as i64,
+                                block_number: withdrawal_msg.common.block_height as i64,
+                                receiver: w.receiver.to_string(),
+                                value: w.amount.to_sat() as i64,
+                                timestamp: block.time as i64,
+                            })
+                            .await?;
+                    }
 
-        Ok(())
+                    transaction.commit().await?;
+                }
+
+                tracing::info!(
+                    "Bridge withdrawal {} inserted",
+                    tx_id.to_hex_string(Case::Lower),
+                );
+            }
+        }
+
+        Ok(true)
     }
 }
 ```
 
+The withdrawal set comes from `get_withdrawal_requests(withdrawal_msg.input.withdrawals)` (the same normalization the verifier uses), all rows for one bridge transaction are inserted in a single database transaction, and a separate `system_wallet.rs` processor keeps the persisted `SystemWallets` current so parsing follows governance rotations.
+
 ## Configuration
 
-### Environment Variables
-
-The L1 Indexer requires the following configuration:
-
-#### Database Configuration
-
-```toml
-# Database connection for indexer
-DATABASE_INDEXER_URL="postgresql://user:password@localhost:5432/via_indexer"
-```
-
-#### Bitcoin Client Configuration
-
-```toml
-# Bitcoin RPC configuration
-VIA_BTC_CLIENT_RPC_URL="http://localhost:8332"
-VIA_BTC_CLIENT_RPC_USER="rpcuser"
-VIA_BTC_CLIENT_RPC_PASSWORD="rpcpassword"
-VIA_BTC_CLIENT_NETWORK="regtest"
-```
-
-#### Indexer-Specific Settings
-
-```toml
-# Starting block for indexing (optional)
-VIA_INDEXER_START_BLOCK=800000
-
-# Batch size for processing transactions
-VIA_INDEXER_BATCH_SIZE=100
-
-# Polling interval in seconds
-VIA_INDEXER_POLL_INTERVAL=10
-```
-
 ### Configuration Structure
+
+The indexer has no config keys of its own. `ViaIndexerConfig` is a bundle of the same config types the node uses (`core/lib/config/src/configs/via_l1_indexer.rs`):
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViaIndexerConfig {
+    pub via_bridge_config: ViaBridgeConfig,
     pub via_genesis_config: ViaGenesisConfig,
     pub via_btc_client_config: ViaBtcClientConfig,
     pub via_btc_watch_config: ViaBtcWatchConfig,
@@ -516,100 +572,213 @@ pub struct ViaIndexerConfig {
 }
 ```
 
+The indexer-relevant knobs live inside these bundles: `via_btc_watch_config` supplies `poll_interval()`, `start_l1_block_number`, and `restart_indexing`; `via_bridge_config.bridge_address` tells the Bitcoin client which wallet to watch; `via_genesis_config` carries the bootstrap transaction ids.
+
+### Loading from the Environment
+
+Every field is loaded through the standard `FromEnv` machinery in `via_indexer/bin/indexer/src/main.rs`; there are no `VIA_INDEXER_*` variables:
+
+```rust
+fn main() -> anyhow::Result<()> {
+    let via_indexer_config = ViaIndexerConfig {
+        health_check: HealthCheckConfig::from_env()?,
+        postgres_config: PostgresConfig::from_env()?,
+        prometheus_config: PrometheusConfig::from_env()?,
+        via_btc_client_config: ViaBtcClientConfig::from_env()?,
+        via_btc_watch_config: ViaBtcWatchConfig::from_env()?,
+        via_genesis_config: ViaGenesisConfig::from_env()?,
+        observability_config: ObservabilityConfig::from_env()?,
+        secrets: ViaSecrets {
+            base_secrets: Secrets {
+                consensus: None,
+                database: DatabaseSecrets::from_env().ok(),
+                l1: None,
+                data_availability: None,
+            },
+            via_l1: ViaL1Secrets::from_env().ok(),
+            via_l2: None,
+            via_da: None,
+        },
+        via_bridge_config: ViaBridgeConfig::from_env()?,
+    };
+
+    let node_builder = node_builder::ViaNodeBuilder::new(via_indexer_config.clone())?;
+
+    let observability_guard = {
+        // Observability initialization should be performed within tokio context.
+        let _context_guard = node_builder.runtime_handle().enter();
+        via_indexer_config.observability_config.install()?
+    };
+
+    // Build the node
+
+    let node = node_builder.build()?;
+    node.run(observability_guard)?;
+
+    Ok(())
+}
+```
+
+### Node Builder
+
+The service is assembled from framework layers, mirroring the main node's builder pattern (`via_indexer/bin/indexer/src/node_builder.rs`):
+
+```rust
+pub fn build(mut self) -> anyhow::Result<ZkStackService> {
+    self = self
+        .add_sigint_handler_layer()?
+        .add_healthcheck_layer()?
+        .add_prometheus_exporter_layer()?
+        .add_pools_layer()?
+        .add_btc_client_layer()?
+        .add_init_indexer_storage_layer()?
+        .add_l1_indexer_layer()?;
+
+    Ok(self.node.build())
+}
+```
+
+Two layer details worth noting:
+
+```rust
+fn add_pools_layer(mut self) -> anyhow::Result<Self> {
+    let config = self.via_indexer_config.postgres_config.clone();
+    let secrets = self
+        .via_indexer_config
+        .secrets
+        .base_secrets
+        .database
+        .clone()
+        .unwrap();
+    let pools_layer = PoolsLayerBuilder::empty(config, secrets)
+        .with_indexer(true)
+        .build();
+    self.node.add_layer(pools_layer);
+    Ok(self)
+}
+
+fn add_btc_client_layer(mut self) -> anyhow::Result<Self> {
+    let secrets = self.via_indexer_config.secrets.clone();
+    let via_btc_client_config = self.via_indexer_config.via_btc_client_config.clone();
+    let via_bridge_config = self.via_indexer_config.via_bridge_config.clone();
+    self.node.add_layer(BtcClientLayer::new(
+        via_btc_client_config,
+        secrets.via_l1.unwrap(),
+        ViaWallets::default(),
+        Some(via_bridge_config.bridge_address.clone()),
+    ));
+    Ok(self)
+}
+```
+
+`with_indexer(true)` provisions the dedicated indexer connection pool, and `BtcClientLayer` is pointed at the bridge address from `ViaBridgeConfig`.
+
 ## Deployment
 
-### Docker Configuration
+### Docker Image
 
-The L1 Indexer includes dedicated Docker support:
-
-#### Dockerfile
+The real Dockerfile lives at `docker/via-l1-indexer/Dockerfile`. The binary target is `via_indexer_bin`, installed into the image as `via_indexer`:
 
 ```dockerfile
-FROM rust:1.70 as builder
+# Will work locally only after prior contracts build
+# syntax=docker/dockerfile:experimental
+FROM matterlabs/zksync-build-base:latest AS builder
 
-WORKDIR /app
+# set of args for use of sccache
+ARG SCCACHE_GCS_BUCKET=""
+ARG SCCACHE_GCS_SERVICE_ACCOUNT=""
+ARG SCCACHE_GCS_RW_MODE=""
+ARG RUSTC_WRAPPER=""
+
+ENV SCCACHE_GCS_BUCKET=${SCCACHE_GCS_BUCKET}
+ENV SCCACHE_GCS_SERVICE_ACCOUNT=${SCCACHE_GCS_SERVICE_ACCOUNT}
+ENV SCCACHE_GCS_RW_MODE=${SCCACHE_GCS_RW_MODE}
+ENV RUSTC_WRAPPER=${RUSTC_WRAPPER}
+
+WORKDIR /usr/src/via
+
 COPY . .
+
+RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
 RUN cargo build --release --bin via_indexer_bin
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/via_indexer_bin /usr/local/bin/via-indexer
-EXPOSE 3000
-CMD ["via-indexer"]
+
+RUN apt-get update && apt-get install -y curl libpq5 liburing-dev ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+ENV PATH=$PATH:/usr/local/bin
+
+EXPOSE 6060
+
+COPY --from=builder /usr/src/via/target/release/via_indexer_bin /usr/bin/via_indexer
+
+ENTRYPOINT ["via_indexer"]
 ```
 
-#### Docker Compose Integration
+### CLI (development)
 
-```yaml
-services:
-  via-indexer:
-    image: via-l1-indexer:latest
-    environment:
-      - DATABASE_INDEXER_URL=postgresql://postgres:password@postgres:5432/via_indexer
-      - VIA_BTC_CLIENT_RPC_URL=http://bitcoind:8332
-      - VIA_BTC_CLIENT_RPC_USER=rpcuser
-      - VIA_BTC_CLIENT_RPC_PASSWORD=rpcpassword
-    depends_on:
-      - postgres
-      - bitcoind
-    ports:
-      - "3001:3000"
+There is no standalone `via-indexer` CLI. Locally the indexer is started through the `via` infrastructure tool, which refreshes the bootstrap txids for the chosen network, loads the env files, and runs the cargo binary (`infrastructure/via/src/indexer.ts`):
+
+```typescript
+export async function indexer(network: string) {
+    await updateBootstrapTxidsEnv(network);
+
+    console.log(`Starting l1 indexer...`);
+    env.load_from_file();
+
+    await utils.spawn(`cargo run --bin via_indexer_bin`);
+}
+
+export const indexerCommand = new Command('indexer')
+    .description('start via indexer node')
+    .option('--network <network>', 'network', 'regtest')
+    .action(async (cmd: Command) => {
+        cmd.chainName ? env.reload(cmd.chainName) : env.load();
+        env.get(true);
+        await indexer(cmd.network);
+    });
 ```
 
-### CLI Deployment
-
-Start the indexer using the CLI:
-
-```bash
-# Start indexer with default configuration
-via-indexer --network regtest
-
-# Start with custom configuration
-via-indexer --network mainnet --config /path/to/config.toml
-
-# Restart indexer service
-via-restart-indexer
-```
+So the entry point is `via indexer --network <regtest|testnet|mainnet>`.
 
 ### Health Checks
 
-The indexer provides health check endpoints:
-
-```bash
-# Check indexer health
-curl http://localhost:3001/health
-
-# Check indexer metrics
-curl http://localhost:3001/metrics
-```
+The node builder installs the standard framework endpoints: `HealthCheckLayer` serves the health endpoint on the port from `HealthCheckConfig`, and `PrometheusExporterLayer` serves pull-mode metrics on `prometheus_config.listener_port`. Both ports come from the shared env config, not from indexer-specific settings.
 
 ## Monitoring and Metrics
 
 ### Prometheus Metrics
 
-The L1 Indexer exposes the following metrics:
+The indexer registers exactly two gauges, and (a quirk worth knowing when building dashboards) they reuse the verifier BTC-watch prefix, so they appear as `via_verifier_btc_watch_last_indexed_block_number` and `via_verifier_btc_watch_current_block_number` (`via_indexer/node/indexer/src/metrics.rs`):
 
-- `via_indexer_blocks_processed_total`: Total blocks processed
-- `via_indexer_deposits_processed_total`: Total deposits processed
-- `via_indexer_withdrawals_processed_total`: Total withdrawals processed
-- `via_indexer_processing_duration_seconds`: Processing time per block
-- `via_indexer_database_operations_total`: Database operation counters
-- `via_indexer_errors_total`: Error counters by type
+```rust
+use vise::{Gauge, Metrics};
+
+#[derive(Debug, Metrics)]
+#[metrics(prefix = "via_verifier_btc_watch")]
+pub struct ViaVerifierBtcWatcherMetrics {
+    /// Last indexed l1 batch number.
+    pub last_indexed_block_number: Gauge<usize>,
+
+    /// Last indexed l1 batch number.
+    pub current_block_number: Gauge<usize>,
+}
+
+#[vise::register]
+pub static METRICS: vise::Global<ViaVerifierBtcWatcherMetrics> = vise::Global::new();
+```
+
+Both are set at the end of every successful `loop_iteration`, so their difference is the indexer's lag behind the Bitcoin tip in blocks. There are no `via_indexer_*` metric names.
 
 ### Logging
 
-Structured logging with configurable levels:
+Standard `tracing` output through `ObservabilityConfig`. The relevant targets are the crate names:
 
-```toml
-# Logging configuration
+```bash
 RUST_LOG="via_indexer=info,via_indexer_dal=debug"
 ```
 
-Log categories:
-- `via_indexer`: Main indexer service logs
-- `via_indexer_dal`: Database access layer logs
-- `via_indexer::deposit`: Deposit processing logs
-- `via_indexer::withdrawal`: Withdrawal processing logs
+Processor activity is logged from the `via_indexer` target (for example "New bridge withdrawal found", "Deposit ... already indexed", "Blocks from x to y processed").
 
 ## Troubleshooting
 
@@ -649,119 +818,63 @@ bitcoin-cli -rpcuser=rpcuser -rpcpassword=rpcpassword getblockchaininfo
 
 #### 3. Indexer Lag Issues
 
-**Symptom:** Indexer falling behind Bitcoin blockchain
+**Symptom:** `via_verifier_btc_watch_current_block_number` keeps growing faster than `via_verifier_btc_watch_last_indexed_block_number`
 
-**Solutions:**
-- Increase `VIA_INDEXER_BATCH_SIZE` for better throughput
-- Optimize database queries and indexes
-- Scale horizontally with multiple indexer instances
-- Monitor system resources (CPU, memory, disk I/O)
+The chunk size is a compile-time constant (`L1_BLOCKS_CHUNK = 100`), so per-tick throughput is fixed. The available knobs:
+- lower `ViaBtcWatchConfig` poll interval so ticks fire more often (each tick indexes up to 100 blocks)
+- check Bitcoin RPC latency; `process_blocks` fetches every block in the range from the node
+- monitor system resources (CPU, memory, disk I/O)
+
+There is no horizontal scaling story: progress is a single `indexer_metadata` row for module `"l1_indexer"`, so exactly one instance should run against a database.
 
 #### 4. Data Consistency Issues
 
 **Symptom:** Missing or duplicate transactions
 
 **Solutions:**
-```sql
--- Check for gaps in processed blocks
-SELECT 
-    block_number,
-    LAG(block_number) OVER (ORDER BY block_number) as prev_block,
-    block_number - LAG(block_number) OVER (ORDER BY block_number) as gap
-FROM (
-    SELECT DISTINCT block_number FROM deposits 
-    UNION 
-    SELECT DISTINCT block_number FROM bridge_withdrawals
-) blocks
-WHERE block_number - LAG(block_number) OVER (ORDER BY block_number) > 1;
 
--- Check for duplicate transactions
-SELECT tx_id, COUNT(*) 
-FROM deposits 
-GROUP BY tx_id 
-HAVING COUNT(*) > 1;
-```
-
-### Performance Optimization
-
-#### Database Optimization
+Duplicates are already prevented at the schema and DAL level (`PRIMARY KEY (tx_id)` plus `ON CONFLICT (tx_id) DO NOTHING` for deposits, `id VARCHAR UNIQUE` for withdrawals, `deposit_exists` dedup in the processor). To rebuild from scratch, set `restart_indexing` in `ViaBtcWatchConfig`: on startup, `initialize_indexer` runs `delete_transactions(start_l1_block_number)` and `delete_metadata()` and re-seeds progress. To inspect manually:
 
 ```sql
--- Add indexes for common queries
-CREATE INDEX CONCURRENTLY idx_deposits_block_number ON deposits(block_number);
-CREATE INDEX CONCURRENTLY idx_deposits_receiver ON deposits(receiver);
-CREATE INDEX CONCURRENTLY idx_withdrawals_receiver ON withdrawals(receiver);
-CREATE INDEX CONCURRENTLY idx_bridge_withdrawals_block_number ON bridge_withdrawals(block_number);
+-- Where is the indexer?
+SELECT module, last_indexer_l1_block, updated_at FROM indexer_metadata;
 
--- Analyze table statistics
-ANALYZE deposits;
-ANALYZE bridge_withdrawals;
-ANALYZE withdrawals;
-ANALYZE indexer_metadata;
+-- Deposits and executed withdrawals per Bitcoin block
+SELECT block_number, COUNT(*) FROM deposits GROUP BY block_number ORDER BY block_number DESC LIMIT 20;
+SELECT block_number, COUNT(*) FROM withdrawals GROUP BY block_number ORDER BY block_number DESC LIMIT 20;
 ```
 
-#### Configuration Tuning
-
-```toml
-# Optimize for high throughput
-VIA_INDEXER_BATCH_SIZE=500
-VIA_INDEXER_POLL_INTERVAL=5
-VIA_INDEXER_MAX_CONCURRENT_REQUESTS=10
-
-# Database connection pool settings
-DATABASE_MAX_CONNECTIONS=20
-DATABASE_MIN_CONNECTIONS=5
-DATABASE_ACQUIRE_TIMEOUT=30
-```
+Note that gaps in `block_number` are normal: most Bitcoin blocks contain no Via activity, and only blocks with matching messages produce rows.
 
 ## Integration Examples
 
 ### Querying Deposit Data
 
-```rust
-use via_indexer_dal::{ConnectionPool, IndexerDal, Indexer};
+Direct SQL against the indexer database (columns as defined in `20250604191948_deposit_withdraw.up.sql`):
 
-async fn get_recent_deposits(
-    pool: &ConnectionPool<Indexer>,
-    limit: i64,
-) -> anyhow::Result<Vec<Deposit>> {
-    let mut connection = pool.connection().await?;
-    
-    let deposits = sqlx::query_as!(
-        Deposit,
-        r#"
-        SELECT priority_id, tx_id, block_number, receiver, value, calldata, canonical_tx_hash
-        FROM deposits 
-        ORDER BY block_number DESC, priority_id DESC 
-        LIMIT $1
-        "#,
-        limit
-    )
-    .fetch_all(connection.as_mut())
-    .await?;
-    
-    Ok(deposits)
-}
+```sql
+-- Most recent deposits
+SELECT priority_id, encode(tx_id, 'hex') AS tx_id, block_number, sender, receiver, value
+FROM deposits
+ORDER BY block_number DESC, priority_id DESC
+LIMIT 20;
+
+-- Which Bitcoin transaction paid a given L2 withdrawal id
+SELECT id, encode(tx_id, 'hex') AS btc_tx_id, l2_tx_log_index, receiver, value, block_number
+FROM withdrawals
+WHERE id = $1;
 ```
 
 ### Monitoring Indexer Progress
 
+Progress lives under the single module name `"l1_indexer"`:
+
 ```rust
-async fn get_indexer_status(
-    pool: &ConnectionPool<Indexer>,
-) -> anyhow::Result<IndexerStatus> {
-    let mut connection = pool.connection().await?;
-    let mut dal = connection.via_indexer_dal();
-    
-    let deposit_block = dal.get_last_processed_l1_block("deposit").await?;
-    let withdrawal_block = dal.get_last_processed_l1_block("withdrawal").await?;
-    
-    Ok(IndexerStatus {
-        deposit_last_block: deposit_block,
-        withdrawal_last_block: withdrawal_block,
-        is_synced: deposit_block == withdrawal_block,
-    })
-}
+let mut connection = pool.connection().await?;
+let last_block = connection
+    .via_indexer_dal()
+    .get_last_processed_l1_block("l1_indexer")
+    .await?;
 ```
 
-The L1 Indexer system provides a robust, scalable foundation for Bitcoin transaction indexing within the Via L2 ecosystem, enabling efficient deposit and withdrawal processing while maintaining data integrity and performance.
+`get_last_processed_l1_block` returns 0 when no metadata row exists yet (`fetch_optional` followed by `unwrap_or(0)`), which is also the condition that triggers `initialize_indexer` to seed the metadata on startup.
